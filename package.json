@@ -1,0 +1,19 @@
+{
+  "name": "@claude-stats/backend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "npx tsx --watch src/server.ts",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@claude-stats/core": "*",
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
