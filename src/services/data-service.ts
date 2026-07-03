@@ -114,20 +114,35 @@ export function getProjectStats(sessions: Session[]): { cwd: string; cost: numbe
     .sort((a, b) => b.cost - a.cost);
 }
 
+// days = 0 (or negative/undefined) → full history from the earliest session
+// up to today; otherwise a trailing window of `days` days ending today.
 export function getDailyChart(sessions: Session[], days = 30): { date: string; sources: Record<string, number> }[] {
-  const today = new Date();
-  const result: { date: string; sources: Record<string, number> }[] = [];
+  if (sessions.length === 0) return [];
 
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
+  // Aggregate cost per source per day once.
+  const byDate: Record<string, Record<string, number>> = {};
+  let minDate = sessions[0].date;
+  for (const s of sessions) {
+    if (s.date < minDate) minDate = s.date;
+    const day = (byDate[s.date] ||= {});
+    day[s.source] = (day[s.source] || 0) + s.cost;
+  }
+
+  const todayStr = new Date().toISOString().split('T')[0];
+  let startStr: string;
+  if (days > 0) {
+    const d = new Date(todayStr + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() - (days - 1));
+    startStr = d.toISOString().split('T')[0];
+  } else {
+    startStr = minDate;
+  }
+
+  const result: { date: string; sources: Record<string, number> }[] = [];
+  const end = new Date(todayStr + 'T00:00:00Z');
+  for (const d = new Date(startStr + 'T00:00:00Z'); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
     const dateStr = d.toISOString().split('T')[0];
-    const daySessions = sessions.filter(s => s.date === dateStr);
-    const sources: Record<string, number> = {};
-    for (const s of daySessions) {
-      sources[s.source] = (sources[s.source] || 0) + s.cost;
-    }
-    result.push({ date: dateStr, sources });
+    result.push({ date: dateStr, sources: byDate[dateStr] || {} });
   }
   return result;
 }
