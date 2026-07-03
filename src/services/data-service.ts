@@ -77,11 +77,21 @@ export function filterSessions(
     const models = filters.model.split(',');
     result = result.filter(s => models.some(m => s.model.toLowerCase().includes(m.toLowerCase())));
   }
+  // from/to may be a date ("YYYY-MM-DD") or a datetime ("YYYY-MM-DDTHH:MM").
+  // With a datetime bound we compare against the session's START moment
+  // (date + first-event time); with a date bound we keep whole-day semantics.
+  // Both s.date/s.time and the incoming bounds are in local time (UTC+3 here).
   if (filters.from) {
-    result = result.filter(s => s.date >= filters.from!);
+    const from = filters.from;
+    result = from.length > 10
+      ? result.filter(s => `${s.date}T${s.time}` >= from.slice(0, 16))
+      : result.filter(s => s.date >= from);
   }
   if (filters.to) {
-    result = result.filter(s => s.date <= filters.to!);
+    const to = filters.to;
+    result = to.length > 10
+      ? result.filter(s => `${s.date}T${s.time}` <= to.slice(0, 16))
+      : result.filter(s => s.date <= to);
   }
   if (filters.minCost) {
     result = result.filter(s => s.cost >= filters.minCost!);
