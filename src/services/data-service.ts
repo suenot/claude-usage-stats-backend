@@ -173,3 +173,14 @@ export function getModelStats(sessions: Session[]): Record<string, number> {
   }
   return result;
 }
+
+export function getSourceStats(sessions: Session[]): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const s of sessions) {
+    result[s.source] = (result[s.source] || 0) + s.cost;
+  }
+  for (const key of Object.keys(result)) {
+    result[key] = parseFloat(result[key].toFixed(2));
+  }
+  return result;
+}
