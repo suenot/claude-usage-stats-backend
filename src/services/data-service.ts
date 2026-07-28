@@ -185,14 +185,24 @@ export function getDailyModelChart(sessions: Session[], days = 30): { date: stri
   return dayGrid(minDate, days).map(date => ({ date, models: byDate[date] || {} }));
 }
 
+// Cost per (day, hour) cell. Uses the same per-message attribution as
+// getHourlyStats, so a long session lights up every hour it actually ran in
+// instead of only the cell it started in.
 export function getHeatmapData(sessions: Session[]): { date: string; hour: number; cost: number; sessions: number }[] {
   const map: Record<string, { cost: number; sessions: number }> = {};
   for (const s of sessions) {
-    const hour = parseInt(s.time.split(':')[0]) || 0;
-    const key = `${s.date}|${hour}`;
-    if (!map[key]) map[key] = { cost: 0, sessions: 0 };
-    map[key].cost += s.cost;
-    map[key].sessions++;
+    const hours = s.hours && Object.keys(s.hours).length > 0
+      ? s.hours
+      : { [parseInt((s.time || '').split(':')[0], 10) || 0]: s };
+
+    for (const [rawHour, usage] of Object.entries(hours)) {
+      const hour = Number(rawHour);
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+      const key = `${s.date}|${hour}`;
+      if (!map[key]) map[key] = { cost: 0, sessions: 0 };
+      map[key].cost += usage.cost;
+      map[key].sessions++;
+    }
   }
   return Object.entries(map).map(([key, data]) => {
     const [date, hourStr] = key.split('|');
@@ -213,22 +223,50 @@ export function getModelStats(sessions: Session[]): Record<string, number> {
   return result;
 }
 
-// Aggregates all sessions by hour-of-day (0-23) across the (already date-
-// filtered) input. Returns every hour so the chart always renders 24 bars.
-export function getHourlyStats(sessions: Session[]): { hour: number; cost: number; sessions: number }[] {
-  const buckets: Record<number, { cost: number; sessions: number }> = {};
-  for (let h = 0; h < 24; h++) buckets[h] = { cost: 0, sessions: 0 };
-  for (const s of sessions) {
-    const hour = parseInt((s.time || '').split(':')[0], 10);
-    if (Number.isNaN(hour) || hour < 0 || hour > 23) continue;
-    buckets[hour].cost += s.cost;
-    buckets[hour].sessions++;
-  }
-  return Array.from({ length: 24 }, (_, hour) => ({
-    hour,
-    cost: parseFloat(buckets[hour].cost.toFixed(2)),
-    sessions: buckets[hour].sessions,
+export interface HourlyStat {
+  hour: number;
+  cost: number;
+  // Sessions ACTIVE during this hour. A session spanning 09:00-14:00 counts in
+  // all six hours, so this column sums to more than the session total.
+  sessions: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read: number;
+  cache_write: number;
+}
+
+// Cost and tokens by hour-of-day (0-23) across the (already date-filtered)
+// input. Always returns all 24 hours so the chart renders a full day.
+//
+// Attribution comes from Session.hours, which the parsers build from each
+// message's own timestamp. Sessions predating that field only know their start
+// time, so they fall back to dumping their totals into that one hour — the old,
+// wrong behaviour, kept only so a stale cache degrades instead of vanishing.
+export function getHourlyStats(sessions: Session[]): HourlyStat[] {
+  const buckets: HourlyStat[] = Array.from({ length: 24 }, (_, hour) => ({
+    hour, cost: 0, sessions: 0, input_tokens: 0, output_tokens: 0, cache_read: 0, cache_write: 0,
   }));
+
+  for (const s of sessions) {
+    const hours = s.hours && Object.keys(s.hours).length > 0
+      ? s.hours
+      : { [parseInt((s.time || '').split(':')[0], 10)]: s };
+
+    for (const [rawHour, usage] of Object.entries(hours)) {
+      const hour = Number(rawHour);
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+      const b = buckets[hour];
+      b.cost += usage.cost;
+      b.input_tokens += usage.input_tokens;
+      b.output_tokens += usage.output_tokens;
+      b.cache_read += usage.cache_read;
+      b.cache_write += usage.cache_write;
+      b.sessions++;
+    }
+  }
+
+  for (const b of buckets) b.cost = parseFloat(b.cost.toFixed(2));
+  return buckets;
 }
 
 export function getSourceStats(sessions: Session[]): Record<string, number> {
