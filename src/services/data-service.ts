@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { collect, getDirectoryFingerprint, getModelFamily, type Session, type CollectorResult } from '@claude-stats/core';
+import { collect, getDirectoryFingerprint, getModelFamily, getPricing, type Session, type CollectorResult } from '@claude-stats/core';
 
 let cachedResult: CollectorResult | null = null;
 let lastFingerprint = '';
@@ -267,6 +267,81 @@ export function getHourlyStats(sessions: Session[]): HourlyStat[] {
 
   for (const b of buckets) b.cost = parseFloat(b.cost.toFixed(2));
   return buckets;
+}
+
+export interface CacheModelRow {
+  model: string;
+  actual: number;
+  saved: number;
+  cache_read: number;
+  hit_rate: number;
+}
+
+export interface CacheStats {
+  actual_cost: number;
+  no_cache_cost: number;
+  saved: number;
+  saved_pct: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read: number;
+  cache_write: number;
+  // Share of PROMPT tokens (input + cache write + cache read) served from cache.
+  hit_rate: number;
+  by_model: CacheModelRow[];
+}
+
+// What prompt caching is worth. The counterfactual: without a cache every
+// cache-read and cache-write token would have been sent as a plain input token
+// at full input price (output is unaffected either way). Priced per session
+// with that session's own model, since the cache discount differs per model.
+export function getCacheStats(sessions: Session[]): CacheStats {
+  const totals = { actual: 0, noCache: 0, input: 0, output: 0, read: 0, write: 0 };
+  const perModel: Record<string, { actual: number; noCache: number; read: number; prompt: number }> = {};
+
+  for (const s of sessions) {
+    const p = getPricing(s.model);
+    const promptTokens = s.input_tokens + s.cache_write + s.cache_read;
+    const noCache = (promptTokens * p.input + s.output_tokens * p.output) / 1_000_000;
+
+    totals.actual += s.cost;
+    totals.noCache += noCache;
+    totals.input += s.input_tokens;
+    totals.output += s.output_tokens;
+    totals.read += s.cache_read;
+    totals.write += s.cache_write;
+
+    const fam = getModelFamily(s.model);
+    const row = (perModel[fam] ||= { actual: 0, noCache: 0, read: 0, prompt: 0 });
+    row.actual += s.cost;
+    row.noCache += noCache;
+    row.read += s.cache_read;
+    row.prompt += promptTokens;
+  }
+
+  const promptTotal = totals.input + totals.write + totals.read;
+  const round = (v: number) => parseFloat(v.toFixed(2));
+
+  return {
+    actual_cost: round(totals.actual),
+    no_cache_cost: round(totals.noCache),
+    saved: round(totals.noCache - totals.actual),
+    saved_pct: totals.noCache > 0 ? round((1 - totals.actual / totals.noCache) * 100) : 0,
+    input_tokens: totals.input,
+    output_tokens: totals.output,
+    cache_read: totals.read,
+    cache_write: totals.write,
+    hit_rate: promptTotal > 0 ? round((totals.read / promptTotal) * 100) : 0,
+    by_model: Object.entries(perModel)
+      .map(([model, r]) => ({
+        model,
+        actual: round(r.actual),
+        saved: round(r.noCache - r.actual),
+        cache_read: r.read,
+        hit_rate: r.prompt > 0 ? round((r.read / r.prompt) * 100) : 0,
+      }))
+      .sort((a, b) => b.saved - a.saved),
+  };
 }
 
 export function getSourceStats(sessions: Session[]): Record<string, number> {
