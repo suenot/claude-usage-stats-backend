@@ -3,7 +3,8 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import {
   getData, refreshData, filterSessions, getSessionById,
-  getProjectStats, getDailyChart, getHeatmapData, getModelStats, getSourceStats,
+  getProjectStats, getDailyChart, getDailyModelChart, getHeatmapData, getModelStats, getSourceStats,
+  getHourlyStats,
   isReady, startBackgroundCollect,
 } from './services/data-service.js';
 
@@ -69,6 +70,13 @@ app.get('/api/charts/daily', (c) => {
   return c.json(getDailyChart(data.sessions, days));
 });
 
+app.get('/api/charts/daily-models', (c) => {
+  const data = getData();
+  if (!data) return c.json({ loading: true }, 503);
+  const days = parseInt(c.req.query('days') || '30');
+  return c.json(getDailyModelChart(data.sessions, days));
+});
+
 app.get('/api/charts/heatmap', (c) => {
   const data = getData();
   if (!data) return c.json({ loading: true }, 503);
@@ -87,6 +95,13 @@ app.get('/api/charts/models', (c) => {
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getModelStats(sessions));
+});
+
+app.get('/api/charts/hourly', (c) => {
+  const data = getData();
+  if (!data) return c.json({ loading: true }, 503);
+  const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
+  return c.json(getHourlyStats(sessions));
 });
 
 app.post('/api/collect', (c) => {

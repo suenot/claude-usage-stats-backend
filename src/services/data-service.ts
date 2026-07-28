@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { collect, getDirectoryFingerprint, type Session, type CollectorResult } from '@claude-stats/core';
+import { collect, getDirectoryFingerprint, getModelFamily, type Session, type CollectorResult } from '@claude-stats/core';
 
 let cachedResult: CollectorResult | null = null;
 let lastFingerprint = '';
@@ -157,6 +157,39 @@ export function getDailyChart(sessions: Session[], days = 30): { date: string; s
   return result;
 }
 
+// Daily total cost broken down by MODEL FAMILY (Opus / Sonnet / Haiku / Fable
+// / GLM 5.2). Same windowing rules as getDailyChart: days=0 → full history.
+export function getDailyModelChart(sessions: Session[], days = 30): { date: string; models: Record<string, number> }[] {
+  if (sessions.length === 0) return [];
+
+  const byDate: Record<string, Record<string, number>> = {};
+  let minDate = sessions[0].date;
+  for (const s of sessions) {
+    if (s.date < minDate) minDate = s.date;
+    const fam = getModelFamily(s.model);
+    const day = (byDate[s.date] ||= {});
+    day[fam] = (day[fam] || 0) + s.cost;
+  }
+
+  const todayStr = new Date().toISOString().split('T')[0];
+  let startStr: string;
+  if (days > 0) {
+    const d = new Date(todayStr + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() - (days - 1));
+    startStr = d.toISOString().split('T')[0];
+  } else {
+    startStr = minDate;
+  }
+
+  const result: { date: string; models: Record<string, number> }[] = [];
+  const end = new Date(todayStr + 'T00:00:00');
+  for (const d = new Date(startStr + 'T00:00:00'); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    const dateStr = d.toISOString().split('T')[0];
+    result.push({ date: dateStr, models: byDate[dateStr] || {} });
+  }
+  return result;
+}
+
 export function getHeatmapData(sessions: Session[]): { date: string; hour: number; cost: number; sessions: number }[] {
   const map: Record<string, { cost: number; sessions: number }> = {};
   for (const s of sessions) {
@@ -175,13 +208,32 @@ export function getHeatmapData(sessions: Session[]): { date: string; hour: numbe
 export function getModelStats(sessions: Session[]): Record<string, number> {
   const result: Record<string, number> = {};
   for (const s of sessions) {
-    const model = s.model || 'unknown';
+    // Empty/missing model = GLM 5.2 proxy session (see core pricing).
+    const model = s.model || 'GLM 5.2';
     result[model] = (result[model] || 0) + s.cost;
   }
   for (const key of Object.keys(result)) {
     result[key] = parseFloat(result[key].toFixed(2));
   }
   return result;
+}
+
+// Aggregates all sessions by hour-of-day (0-23) across the (already date-
+// filtered) input. Returns every hour so the chart always renders 24 bars.
+export function getHourlyStats(sessions: Session[]): { hour: number; cost: number; sessions: number }[] {
+  const buckets: Record<number, { cost: number; sessions: number }> = {};
+  for (let h = 0; h < 24; h++) buckets[h] = { cost: 0, sessions: 0 };
+  for (const s of sessions) {
+    const hour = parseInt((s.time || '').split(':')[0], 10);
+    if (Number.isNaN(hour) || hour < 0 || hour > 23) continue;
+    buckets[hour].cost += s.cost;
+    buckets[hour].sessions++;
+  }
+  return Array.from({ length: 24 }, (_, hour) => ({
+    hour,
+    cost: parseFloat(buckets[hour].cost.toFixed(2)),
+    sessions: buckets[hour].sessions,
+  }));
 }
 
 export function getSourceStats(sessions: Session[]): Record<string, number> {
