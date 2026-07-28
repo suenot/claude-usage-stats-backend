@@ -124,8 +124,35 @@ export function getProjectStats(sessions: Session[]): { cwd: string; cost: numbe
     .sort((a, b) => b.cost - a.cost);
 }
 
-// days = 0 (or negative/undefined) → full history from the earliest session
-// up to today; otherwise a trailing window of `days` days ending today.
+// Session dates (s.date) are LOCAL-time day strings, so the day grid we build
+// around them must be local too. Date#toISOString() renders in UTC, which in
+// any non-UTC zone names a different calendar day than the Date was built
+// from — that mismatch is what used to drop today's row from the charts.
+function localDay(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// Every local day string from the window start through today, inclusive.
+// days = 0 (or negative) → full history starting at `minDate`; otherwise a
+// trailing window of `days` days ending today.
+function dayGrid(minDate: string, days: number): string[] {
+  const now = new Date();
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  const cur = new Date(end);
+  if (days > 0) {
+    cur.setDate(cur.getDate() - (days - 1));
+  } else {
+    const [y, m, d] = minDate.split('-').map(Number);
+    cur.setFullYear(y, m - 1, d);
+  }
+
+  const out: string[] = [];
+  for (; cur <= end; cur.setDate(cur.getDate() + 1)) out.push(localDay(cur));
+  return out;
+}
+
 export function getDailyChart(sessions: Session[], days = 30): { date: string; sources: Record<string, number> }[] {
   if (sessions.length === 0) return [];
 
@@ -138,23 +165,7 @@ export function getDailyChart(sessions: Session[], days = 30): { date: string; s
     day[s.source] = (day[s.source] || 0) + s.cost;
   }
 
-  const todayStr = new Date().toISOString().split('T')[0];
-  let startStr: string;
-  if (days > 0) {
-    const d = new Date(todayStr + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() - (days - 1));
-    startStr = d.toISOString().split('T')[0];
-  } else {
-    startStr = minDate;
-  }
-
-  const result: { date: string; sources: Record<string, number> }[] = [];
-  const end = new Date(todayStr + 'T00:00:00Z');
-  for (const d = new Date(startStr + 'T00:00:00Z'); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
-    const dateStr = d.toISOString().split('T')[0];
-    result.push({ date: dateStr, sources: byDate[dateStr] || {} });
-  }
-  return result;
+  return dayGrid(minDate, days).map(date => ({ date, sources: byDate[date] || {} }));
 }
 
 // Daily total cost broken down by MODEL FAMILY (Opus / Sonnet / Haiku / Fable
@@ -171,23 +182,7 @@ export function getDailyModelChart(sessions: Session[], days = 30): { date: stri
     day[fam] = (day[fam] || 0) + s.cost;
   }
 
-  const todayStr = new Date().toISOString().split('T')[0];
-  let startStr: string;
-  if (days > 0) {
-    const d = new Date(todayStr + 'T00:00:00Z');
-    d.setUTCDate(d.getUTCDate() - (days - 1));
-    startStr = d.toISOString().split('T')[0];
-  } else {
-    startStr = minDate;
-  }
-
-  const result: { date: string; models: Record<string, number> }[] = [];
-  const end = new Date(todayStr + 'T00:00:00');
-  for (const d = new Date(startStr + 'T00:00:00'); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
-    const dateStr = d.toISOString().split('T')[0];
-    result.push({ date: dateStr, models: byDate[dateStr] || {} });
-  }
-  return result;
+  return dayGrid(minDate, days).map(date => ({ date, models: byDate[date] || {} }));
 }
 
 export function getHeatmapData(sessions: Session[]): { date: string; hour: number; cost: number; sessions: number }[] {
