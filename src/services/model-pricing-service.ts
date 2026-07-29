@@ -27,7 +27,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function perMillion(value: unknown): number | null {
-  if (typeof value !== 'string') return null;
+  if (typeof value !== 'string' || !value.trim()) return null;
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return null;
   return parsed * 1_000_000;

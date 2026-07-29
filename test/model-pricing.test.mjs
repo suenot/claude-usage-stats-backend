@@ -86,6 +86,31 @@ test('normalization rejects missing, negative, non-finite, and malformed values'
   });
 });
 
+test('normalization rejects empty and whitespace-only price strings', () => {
+  const [model] = normalizeOpenRouterModels({
+    data: [{
+      id: 'test/empty-prices',
+      name: 'Empty prices',
+      pricing: {
+        prompt: '',
+        completion: '   ',
+        input_cache_read: '',
+        input_cache_write: '   ',
+      },
+    }],
+  });
+
+  assert.deepEqual(
+    [
+      model.inputPerMillion,
+      model.outputPerMillion,
+      model.cacheReadPerMillion,
+      model.cacheWritePerMillion,
+    ],
+    [null, null, null, null],
+  );
+});
+
 test('reuses a successful snapshot for five minutes', async () => {
   let calls = 0;
   let time = 1_000;
