@@ -9,32 +9,40 @@ import {
 } from './services/data-service.js';
 import { modelPricingService } from './services/model-pricing-service.js';
 
-const app = new Hono();
+type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
 
-app.use('*', cors());
+export function createApp(options: {
+  isReady?: typeof isReady;
+  modelPricingService?: PricingService;
+} = {}) {
+  const ready = options.isReady ?? isReady;
+  const pricing = options.modelPricingService ?? modelPricingService;
+  const app = new Hono();
 
-// Return 503 while data is loading
-app.use('/api/*', async (c, next) => {
-  if (!isReady() && c.req.path !== '/api/status' && c.req.path !== '/api/models/pricing') {
-    return c.json({ loading: true, message: 'Collecting data, please wait...' }, 503);
-  }
-  return next();
-});
+  app.use('*', cors());
 
-app.get('/api/status', (c) => {
-  return c.json({ ready: isReady() });
-});
+  // Return 503 while data is loading
+  app.use('/api/*', async (c, next) => {
+    if (!ready() && c.req.path !== '/api/status' && c.req.path !== '/api/models/pricing') {
+      return c.json({ loading: true, message: 'Collecting data, please wait...' }, 503);
+    }
+    return next();
+  });
 
-app.get('/api/models/pricing', async (c) => {
-  try {
-    const pricing = await modelPricingService.getModelPricing({
-      force: c.req.query('refresh') === '1',
-    });
-    return c.json(pricing);
-  } catch {
-    return c.json({ error: 'OpenRouter pricing is unavailable' }, 502);
-  }
-});
+  app.get('/api/status', (c) => {
+    return c.json({ ready: ready() });
+  });
+
+  app.get('/api/models/pricing', async (c) => {
+    try {
+      const modelPrices = await pricing.getModelPricing({
+        force: c.req.query('refresh') === '1',
+      });
+      return c.json(modelPrices);
+    } catch {
+      return c.json({ error: 'OpenRouter pricing is unavailable' }, 502);
+    }
+  });
 
 app.get('/api/summary', (c) => {
   const data = getData();
@@ -145,9 +153,16 @@ app.post('/api/collect', (c) => {
   return c.json({ message: 'Data refreshed', sessions: result.sessions.length });
 });
 
+  return app;
+}
+
+const app = createApp();
+
 const port = parseInt(process.env.PORT || '3001');
 
-// Start server immediately, collect data in background
-startBackgroundCollect();
-console.log(`Claude Stats API running on http://localhost:${port}`);
-serve({ fetch: app.fetch, port });
+if (process.env.NODE_ENV !== 'test') {
+  // Start server immediately, collect data in background
+  startBackgroundCollect();
+  console.log(`Claude Stats API running on http://localhost:${port}`);
+  serve({ fetch: app.fetch, port });
+}

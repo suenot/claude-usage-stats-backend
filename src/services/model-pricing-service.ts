@@ -88,12 +88,22 @@ export function createModelPricingService(deps: {
       throw new Error(`OpenRouter models request failed: ${response.status}`);
     }
 
+    const payload = await response.json();
+    if (!isRecord(payload) || !Array.isArray(payload.data)) {
+      throw new Error('OpenRouter pricing payload is unavailable');
+    }
+
+    const models = normalizeOpenRouterModels(payload);
+    if (models.length === 0 || models.length !== payload.data.length) {
+      throw new Error('OpenRouter pricing payload is unavailable');
+    }
+
     const fetchedAt = new Date(now()).toISOString();
     const freshSnapshot: ModelPricingResponse = {
       source: 'OpenRouter',
       fetchedAt,
       stale: false,
-      models: normalizeOpenRouterModels(await response.json()),
+      models,
     };
     snapshot = freshSnapshot;
     return freshSnapshot;

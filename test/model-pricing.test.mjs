@@ -111,6 +111,47 @@ test('normalization rejects empty and whitespace-only price strings', () => {
   );
 });
 
+test('rejects malformed, missing, non-array, empty, and unnormalizable model payloads', async () => {
+  for (const payload of [null, {}, { data: {} }, { data: [] }, { data: [{ id: null }] }]) {
+    const service = createModelPricingService({ fetcher: async () => response(payload) });
+    await assert.rejects(service.getModelPricing(), /OpenRouter pricing payload is unavailable/);
+  }
+});
+
+test('preserves a successful snapshot when a forced refresh has an empty catalog', async () => {
+  let payload = upstreamPayload;
+  const service = createModelPricingService({ fetcher: async () => response(payload) });
+
+  const fresh = await service.getModelPricing();
+  payload = { data: [] };
+  const stale = await service.getModelPricing({ force: true });
+
+  assert.equal(stale.stale, true);
+  assert.deepEqual(stale.models, fresh.models);
+});
+
+test('rejects an initial catalog with mixed valid and malformed model records', async () => {
+  const service = createModelPricingService({
+    fetcher: async () => response({
+      data: [upstreamPayload.data[0], { id: null, pricing: {} }],
+    }),
+  });
+
+  await assert.rejects(service.getModelPricing(), /OpenRouter pricing payload is unavailable/);
+});
+
+test('preserves a successful snapshot when a forced refresh has a mixed catalog', async () => {
+  let payload = upstreamPayload;
+  const service = createModelPricingService({ fetcher: async () => response(payload) });
+
+  const fresh = await service.getModelPricing();
+  payload = { data: [upstreamPayload.data[0], { id: null, pricing: {} }] };
+  const stale = await service.getModelPricing({ force: true });
+
+  assert.equal(stale.stale, true);
+  assert.deepEqual(stale.models, fresh.models);
+});
+
 test('reuses a successful snapshot for five minutes', async () => {
   let calls = 0;
   let time = 1_000;
