@@ -7,6 +7,7 @@ import {
   getHourlyStats, getCacheStats,
   isReady, startBackgroundCollect,
 } from './services/data-service.js';
+import { modelPricingService } from './services/model-pricing-service.js';
 
 const app = new Hono();
 
@@ -14,7 +15,7 @@ app.use('*', cors());
 
 // Return 503 while data is loading
 app.use('/api/*', async (c, next) => {
-  if (!isReady() && c.req.path !== '/api/status') {
+  if (!isReady() && c.req.path !== '/api/status' && c.req.path !== '/api/models/pricing') {
     return c.json({ loading: true, message: 'Collecting data, please wait...' }, 503);
   }
   return next();
@@ -22,6 +23,17 @@ app.use('/api/*', async (c, next) => {
 
 app.get('/api/status', (c) => {
   return c.json({ ready: isReady() });
+});
+
+app.get('/api/models/pricing', async (c) => {
+  try {
+    const pricing = await modelPricingService.getModelPricing({
+      force: c.req.query('refresh') === '1',
+    });
+    return c.json(pricing);
+  } catch {
+    return c.json({ error: 'OpenRouter pricing is unavailable' }, 502);
+  }
 });
 
 app.get('/api/summary', (c) => {
