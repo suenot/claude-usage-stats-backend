@@ -78,22 +78,54 @@ export function filterSessions(
     const models = filters.model.split(',');
     result = result.filter(s => models.some(m => s.model.toLowerCase().includes(m.toLowerCase())));
   }
-  // from/to may be a date ("YYYY-MM-DD") or a datetime ("YYYY-MM-DDTHH:MM").
-  // With a datetime bound we compare against the session's START moment
-  // (date + first-event time); with a date bound we keep whole-day semantics.
-  // Both s.date/s.time and the incoming bounds are in local time (UTC+3 here).
-  if (filters.from) {
-    const from = filters.from;
-    result = from.length > 10
-      ? result.filter(s => `${s.date}T${s.time}` >= from.slice(0, 16))
-      : result.filter(s => s.date >= from);
+
+  // Date-only bounds retain whole-day semantics. Datetime bounds intersect
+  // the real hourly buckets and return a clipped copy, so every downstream
+  // aggregator sees only usage from the selected interval. Legacy sessions
+  // without hours keep their previous start-time filtering behavior.
+  if (filters.from && filters.from.length <= 10) {
+    result = result.filter(s => s.date >= filters.from!);
   }
-  if (filters.to) {
-    const to = filters.to;
-    result = to.length > 10
-      ? result.filter(s => `${s.date}T${s.time}` <= to.slice(0, 16))
-      : result.filter(s => s.date <= to);
+  if (filters.to && filters.to.length <= 10) {
+    result = result.filter(s => s.date <= filters.to!);
   }
+
+  const fromTime = filters.from && filters.from.length > 10 ? filters.from.slice(0, 16) : undefined;
+  const toTime = filters.to && filters.to.length > 10 ? filters.to.slice(0, 16) : undefined;
+  if (fromTime || toTime) {
+    result = result.flatMap(session => {
+      const hourEntries = Object.entries(session.hours || {});
+      if (hourEntries.length === 0) {
+        const startedAt = `${session.date}T${session.time}`.slice(0, 16);
+        return (!fromTime || startedAt >= fromTime) && (!toTime || startedAt <= toTime)
+          ? [session]
+          : [];
+      }
+
+      const hours = Object.fromEntries(hourEntries.filter(([rawHour]) => {
+        const hour = Number(rawHour);
+        if (!Number.isInteger(hour) || hour < 0 || hour > 23) return false;
+        const hourStart = `${session.date}T${String(hour).padStart(2, '0')}:00`;
+        const hourEnd = `${session.date}T${String(hour).padStart(2, '0')}:59`;
+        return (!fromTime || hourEnd >= fromTime) && (!toTime || hourStart <= toTime);
+      }));
+      const selectedHours = Object.values(hours);
+      if (selectedHours.length === 0) return [];
+
+      const totals = selectedHours.reduce(
+        (sum, usage) => ({
+          cost: sum.cost + usage.cost,
+          input_tokens: sum.input_tokens + usage.input_tokens,
+          output_tokens: sum.output_tokens + usage.output_tokens,
+          cache_read: sum.cache_read + usage.cache_read,
+          cache_write: sum.cache_write + usage.cache_write,
+        }),
+        { cost: 0, input_tokens: 0, output_tokens: 0, cache_read: 0, cache_write: 0 },
+      );
+      return [{ ...session, ...totals, hours }];
+    });
+  }
+
   if (filters.minCost) {
     result = result.filter(s => s.cost >= filters.minCost!);
   }
@@ -125,11 +157,9 @@ export function getProjectStats(sessions: Session[]): { cwd: string; cost: numbe
     .sort((a, b) => b.cost - a.cost);
 }
 
-// Session dates (s.date) are LOCAL-time day strings, so the day grid we build
-// around them must be local too. Date#toISOString() renders in UTC, which in
-// any non-UTC zone names a different calendar day than the Date was built
-// from — that mismatch is what used to drop today's row from the charts.
-function localDay(d: Date): string {
+// Session dates are local wall-clock strings produced by the collector. Match
+// the runtime's configured timezone here; no fixed UTC offset is assumed.
+export function formatLocalDay(d: Date): string {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
@@ -150,42 +180,104 @@ function dayGrid(minDate: string, days: number): string[] {
   }
 
   const out: string[] = [];
-  for (; cur <= end; cur.setDate(cur.getDate() + 1)) out.push(localDay(cur));
+  for (; cur <= end; cur.setDate(cur.getDate() + 1)) out.push(formatLocalDay(cur));
   return out;
 }
 
-export function getDailyChart(sessions: Session[], days = 30): { date: string; sources: Record<string, number> }[] {
-  if (sessions.length === 0) return [];
+export type HistoryTimeframe = '1d' | '1h';
+export type HistoryGroupBy = 'harness' | 'model';
 
-  // Aggregate cost per source per day once.
-  const byDate: Record<string, Record<string, number>> = {};
+export interface HistoryValue {
+  usd: number;
+  tokens: number;
+}
+
+export interface HistoryBucket {
+  timestamp: string;
+  values: Record<string, HistoryValue>;
+}
+
+export interface HistoryChart {
+  timeframe: HistoryTimeframe;
+  groupBy: HistoryGroupBy;
+  buckets: HistoryBucket[];
+}
+
+export function getHistoryChart(
+  sessions: Session[],
+  options: { timeframe?: HistoryTimeframe; groupBy?: HistoryGroupBy; days?: number } = {},
+): HistoryChart {
+  const timeframe = options.timeframe || '1d';
+  const groupBy = options.groupBy || 'harness';
+  const days = options.days ?? 30;
+  if (sessions.length === 0) return { timeframe, groupBy, buckets: [] };
+
   let minDate = sessions[0].date;
-  for (const s of sessions) {
-    if (s.date < minDate) minDate = s.date;
-    const day = (byDate[s.date] ||= {});
-    day[s.source] = (day[s.source] || 0) + s.cost;
+  const valuesByTimestamp: Record<string, Record<string, HistoryValue>> = {};
+
+  const add = (
+    timestamp: string,
+    series: string,
+    usage: Pick<Session, 'cost' | 'input_tokens' | 'output_tokens' | 'cache_read' | 'cache_write'>,
+  ) => {
+    const values = (valuesByTimestamp[timestamp] ||= {});
+    const value = (values[series] ||= { usd: 0, tokens: 0 });
+    value.usd += usage.cost;
+    value.tokens += usage.input_tokens + usage.output_tokens + usage.cache_read + usage.cache_write;
+  };
+
+  for (const session of sessions) {
+    if (session.date < minDate) minDate = session.date;
+    const series = groupBy === 'model' ? getModelFamily(session.model) : session.source;
+
+    if (timeframe === '1d') {
+      add(session.date, series, session);
+      continue;
+    }
+
+    for (const [rawHour, usage] of Object.entries(session.hours || {})) {
+      const hour = Number(rawHour);
+      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+      add(`${session.date}T${String(hour).padStart(2, '0')}:00`, series, usage);
+    }
   }
 
-  return dayGrid(minDate, days).map(date => ({ date, sources: byDate[date] || {} }));
+  let timestamps: string[];
+  if (timeframe === '1d') {
+    timestamps = dayGrid(minDate, days);
+  } else {
+    const includedDays = new Set(dayGrid(minDate, days));
+    timestamps = Object.keys(valuesByTimestamp)
+      .filter(timestamp => includedDays.has(timestamp.slice(0, 10)))
+      .sort();
+  }
+  return {
+    timeframe,
+    groupBy,
+    buckets: timestamps.map(timestamp => ({
+      timestamp,
+      values: valuesByTimestamp[timestamp] || {},
+    })),
+  };
+}
+
+export function getDailyChart(sessions: Session[], days = 30): { date: string; sources: Record<string, number> }[] {
+  return getHistoryChart(sessions, { timeframe: '1d', groupBy: 'harness', days }).buckets.map(bucket => ({
+    date: bucket.timestamp,
+    sources: Object.fromEntries(Object.entries(bucket.values).map(([series, value]) => [series, value.usd])),
+  }));
 }
 
 // Daily total cost broken down by MODEL FAMILY (Opus / Sonnet / Haiku / Fable
 // / GLM 5.2). Same windowing rules as getDailyChart: days=0 → full history.
 export function getDailyModelChart(sessions: Session[], days = 30): { date: string; models: Record<string, number>; tokens: Record<string, number> }[] {
-  if (sessions.length === 0) return [];
-
-  const byDate: Record<string, { models: Record<string, number>; tokens: Record<string, number> }> = {};
-  let minDate = sessions[0].date;
-  for (const s of sessions) {
-    if (s.date < minDate) minDate = s.date;
-    const fam = getModelFamily(s.model);
-    const day = (byDate[s.date] ||= { models: {}, tokens: {} });
-    day.models[fam] = (day.models[fam] || 0) + s.cost;
-    const tokens = s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
-    day.tokens[s.source] = (day.tokens[s.source] || 0) + tokens;
-  }
-
-  return dayGrid(minDate, days).map(date => ({ date, ...(byDate[date] || { models: {}, tokens: {} }) }));
+  const models = getHistoryChart(sessions, { timeframe: '1d', groupBy: 'model', days }).buckets;
+  const harnesses = getHistoryChart(sessions, { timeframe: '1d', groupBy: 'harness', days }).buckets;
+  return models.map((bucket, index) => ({
+    date: bucket.timestamp,
+    models: Object.fromEntries(Object.entries(bucket.values).map(([series, value]) => [series, value.usd])),
+    tokens: Object.fromEntries(Object.entries(harnesses[index]?.values || {}).map(([series, value]) => [series, value.tokens])),
+  }));
 }
 
 // Cost per (day, hour) cell. Uses the same per-message attribution as

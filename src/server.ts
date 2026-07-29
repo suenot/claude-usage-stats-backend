@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import {
   getData, refreshData, filterSessions, getSessionById,
-  getProjectStats, getDailyChart, getDailyModelChart, getHeatmapData, getModelStats, getSourceStats, getSourceUsage,
+  getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getSourceStats, getSourceUsage,
   getHourlyStats, getCacheStats,
   isReady, startBackgroundCollect,
 } from './services/data-service.js';
@@ -75,6 +75,16 @@ app.get('/api/charts/daily-models', (c) => {
   if (!data) return c.json({ loading: true }, 503);
   const days = parseInt(c.req.query('days') || '30');
   return c.json(getDailyModelChart(data.sessions, days));
+});
+
+app.get('/api/charts/history', (c) => {
+  const data = getData();
+  if (!data) return c.json({ loading: true }, 503);
+  const timeframe = c.req.query('timeframe') === '1h' ? '1h' : '1d';
+  const groupBy = c.req.query('groupBy') === 'model' ? 'model' : 'harness';
+  const rawDays = parseInt(c.req.query('days') || '30');
+  const days = Number.isNaN(rawDays) ? 30 : Math.max(0, rawDays);
+  return c.json(getHistoryChart(data.sessions, { timeframe, groupBy, days }));
 });
 
 app.get('/api/charts/heatmap', (c) => {

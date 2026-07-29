@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "test": "npm --prefix ../core run build && npm run build && node --test test/*.test.mjs",
     "dev": "npx tsx --watch src/server.ts",
     "start": "node dist/server.js"
   },
