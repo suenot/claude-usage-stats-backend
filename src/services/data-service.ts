@@ -355,3 +355,15 @@ export function getSourceStats(sessions: Session[]): Record<string, number> {
   }
   return result;
 }
+
+export function getSourceUsage(sessions: Session[]): Record<string, { cost: number; sessions: number; tokens: number }> {
+  const result: Record<string, { cost: number; sessions: number; tokens: number }> = {};
+  for (const s of sessions) {
+    const source = result[s.source] ||= { cost: 0, sessions: 0, tokens: 0 };
+    source.cost += s.cost;
+    source.sessions++;
+    source.tokens += s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
+  }
+  for (const source of Object.values(result)) source.cost = parseFloat(source.cost.toFixed(2));
+  return result;
+}
