@@ -171,19 +171,21 @@ export function getDailyChart(sessions: Session[], days = 30): { date: string; s
 
 // Daily total cost broken down by MODEL FAMILY (Opus / Sonnet / Haiku / Fable
 // / GLM 5.2). Same windowing rules as getDailyChart: days=0 → full history.
-export function getDailyModelChart(sessions: Session[], days = 30): { date: string; models: Record<string, number> }[] {
+export function getDailyModelChart(sessions: Session[], days = 30): { date: string; models: Record<string, number>; tokens: Record<string, number> }[] {
   if (sessions.length === 0) return [];
 
-  const byDate: Record<string, Record<string, number>> = {};
+  const byDate: Record<string, { models: Record<string, number>; tokens: Record<string, number> }> = {};
   let minDate = sessions[0].date;
   for (const s of sessions) {
     if (s.date < minDate) minDate = s.date;
     const fam = getModelFamily(s.model);
-    const day = (byDate[s.date] ||= {});
-    day[fam] = (day[fam] || 0) + s.cost;
+    const day = (byDate[s.date] ||= { models: {}, tokens: {} });
+    day.models[fam] = (day.models[fam] || 0) + s.cost;
+    const tokens = s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
+    day.tokens[s.source] = (day.tokens[s.source] || 0) + tokens;
   }
 
-  return dayGrid(minDate, days).map(date => ({ date, models: byDate[date] || {} }));
+  return dayGrid(minDate, days).map(date => ({ date, ...(byDate[date] || { models: {}, tokens: {} }) }));
 }
 
 // Cost per (day, hour) cell. Uses the same per-message attribution as
