@@ -7,6 +7,7 @@ let collecting = false;
 
 const WATCHED_DIRS = [
   path.join(process.env.HOME || '', '.claude/projects'),
+  path.join(process.env.HOME || '', '.codex/sessions'),
   path.join(process.env.HOME || '', 'Library/Application Support/Claude/local-agent-mode-sessions'),
 ];
 
