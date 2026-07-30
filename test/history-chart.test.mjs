@@ -161,6 +161,9 @@ test('datetime range includes and clips a session with activity after its start 
   assert.deepEqual(dataService.getModelStats(filtered), {
     'claude-3-5-sonnet': 2,
   });
+  assert.deepEqual(dataService.getHeatmapData(filtered), [
+    { date: '2026-01-02', hour: 10, cost: 2, sessions: 1 },
+  ]);
   assert.equal(dataService.getHourlyStats(filtered)[9].cost, 0);
   assert.equal(dataService.getHourlyStats(filtered)[10].cost, 2);
 });

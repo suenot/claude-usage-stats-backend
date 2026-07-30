@@ -110,7 +110,8 @@ app.get('/api/charts/history', (c) => {
 app.get('/api/charts/heatmap', (c) => {
   const data = getData();
   if (!data) return c.json({ loading: true }, 503);
-  return c.json(getHeatmapData(data.sessions));
+  const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
+  return c.json(getHeatmapData(sessions));
 });
 
 app.get('/api/charts/sources', (c) => {
