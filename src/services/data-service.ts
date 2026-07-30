@@ -136,26 +136,90 @@ export function getSessionById(sessions: Session[], id: string): Session | undef
   return sessions.find(s => s.sessionId === id);
 }
 
-export function getProjectStats(sessions: Session[]): { cwd: string; cost: number; tokens: number; sessions: number; sources: string[]; models: string[] }[] {
-  const map: Record<string, { cost: number; tokens: number; sessions: number; sources: Set<string>; models: Set<string> }> = {};
+type ProjectBreakdown = Record<string, { usd: number; tokens: number; sessions: number }>;
+
+export type ProjectEntry = {
+  cwd: string;
+  cost: number;
+  tokens: number;
+  sessions: number;
+  sources: string[];
+  models: string[];
+  byModel: ProjectBreakdown;
+  byHarness: ProjectBreakdown;
+};
+
+function addProjectBreakdownUsage(breakdown: ProjectBreakdown, key: string, usd: number, tokens: number): void {
+  if (!breakdown[key]) breakdown[key] = { usd: 0, tokens: 0, sessions: 0 };
+  breakdown[key].usd += usd;
+  breakdown[key].tokens += tokens;
+  breakdown[key].sessions++;
+}
+
+function usdToCents(usd: number): number {
+  const rawCents = usd * 100;
+  return Math.round(rawCents + Number.EPSILON * Math.max(1, Math.abs(rawCents)));
+}
+
+function allocateProjectBreakdown(breakdown: ProjectBreakdown, totalCents: number): ProjectBreakdown {
+  const entries = Object.entries(breakdown).map(([key, value]) => {
+    const rawCents = value.usd * 100;
+    const cents = Math.floor(rawCents);
+    return { key, value, cents, remainder: rawCents - cents };
+  });
+  const allocatedCents = entries.reduce((sum, entry) => sum + entry.cents, 0);
+  const centsToAllocate = totalCents - allocatedCents;
+  const allocationOrder = [...entries].sort((a, b) => {
+    if (a.remainder !== b.remainder) return b.remainder - a.remainder;
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  });
+  for (let i = 0; i < centsToAllocate; i++) allocationOrder[i].cents++;
+
+  return Object.fromEntries(entries.map(({ key, value, cents }) => [
+    key,
+    { ...value, usd: cents / 100 },
+  ]));
+}
+
+export function getProjectStats(sessions: Session[]): ProjectEntry[] {
+  const map: Record<string, {
+    cost: number;
+    tokens: number;
+    sessions: number;
+    byModel: ProjectBreakdown;
+    byHarness: ProjectBreakdown;
+  }> = {};
   for (const s of sessions) {
     const key = s.cwd || '(no project)';
-    if (!map[key]) map[key] = { cost: 0, tokens: 0, sessions: 0, sources: new Set(), models: new Set() };
-    map[key].cost += s.cost;
-    map[key].tokens += s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
-    map[key].sessions++;
-    map[key].sources.add(s.source);
-    if (s.model) map[key].models.add(s.model);
+    const model = s.model || 'GLM 5.2';
+    const harness = s.source || 'Unknown';
+    const tokens = s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
+    if (!map[key]) {
+      map[key] = { cost: 0, tokens: 0, sessions: 0, byModel: {}, byHarness: {} };
+    }
+    const project = map[key];
+    project.cost += s.cost;
+    project.tokens += tokens;
+    project.sessions++;
+    addProjectBreakdownUsage(project.byModel, model, s.cost, tokens);
+    addProjectBreakdownUsage(project.byHarness, harness, s.cost, tokens);
   }
   return Object.entries(map)
-    .map(([cwd, data]) => ({
-      cwd,
-      cost: parseFloat(data.cost.toFixed(2)),
-      tokens: data.tokens,
-      sessions: data.sessions,
-      sources: [...data.sources],
-      models: [...data.models],
-    }))
+    .map(([cwd, data]) => {
+      const totalCents = usdToCents(data.cost);
+      const byModel = allocateProjectBreakdown(data.byModel, totalCents);
+      const byHarness = allocateProjectBreakdown(data.byHarness, totalCents);
+      return {
+        cwd,
+        cost: totalCents / 100,
+        tokens: data.tokens,
+        sessions: data.sessions,
+        sources: Object.keys(byHarness),
+        models: Object.keys(byModel),
+        byModel,
+        byHarness,
+      };
+    })
     .sort((a, b) => b.cost - a.cost);
 }
 
