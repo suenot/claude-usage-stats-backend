@@ -155,8 +155,35 @@ test('datetime range includes and clips a session with activity after its start 
   assert.deepEqual(dataService.getSourceUsage(filtered), {
     'Claude Code': { cost: 2, sessions: 1, tokens: 90 },
   });
+  assert.deepEqual(dataService.getModelUsage(filtered), {
+    'claude-3-5-sonnet': { cost: 2, sessions: 1, tokens: 90 },
+  });
+  assert.deepEqual(dataService.getModelStats(filtered), {
+    'claude-3-5-sonnet': 2,
+  });
   assert.equal(dataService.getHourlyStats(filtered)[9].cost, 0);
   assert.equal(dataService.getHourlyStats(filtered)[10].cost, 2);
+});
+
+test('model usage aggregates cost, tokens, and sessions while preserving the legacy cost adapter', () => {
+  const usage = dataService.getModelUsage([
+    sessions[0],
+    { ...sessions[0], cost: 1.235, input_tokens: 1, output_tokens: 2, cache_read: 3, cache_write: 4 },
+    { ...sessions[1], model: '', cost: 0.335 },
+  ]);
+
+  assert.deepEqual(usage, {
+    'claude-3-5-sonnet': { cost: 4.24, sessions: 2, tokens: 110 },
+    'GLM 5.2': { cost: 0.34, sessions: 1, tokens: 50 },
+  });
+  assert.deepEqual(dataService.getModelStats([
+    sessions[0],
+    { ...sessions[0], cost: 1.235, input_tokens: 1, output_tokens: 2, cache_read: 3, cache_write: 4 },
+    { ...sessions[1], model: '', cost: 0.335 },
+  ]), {
+    'claude-3-5-sonnet': 4.24,
+    'GLM 5.2': 0.34,
+  });
 });
 
 test('date-only bounds and legacy datetime filtering retain their prior behavior', () => {

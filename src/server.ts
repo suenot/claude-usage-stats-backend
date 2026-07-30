@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import {
   getData, refreshData, filterSessions, getSessionById,
-  getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getSourceStats, getSourceUsage,
+  getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getModelUsage, getSourceStats, getSourceUsage,
   getHourlyStats, getCacheStats,
   isReady, startBackgroundCollect,
 } from './services/data-service.js';
@@ -132,6 +132,13 @@ app.get('/api/charts/models', (c) => {
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getModelStats(sessions));
+});
+
+app.get('/api/charts/model-usage', (c) => {
+  const data = getData();
+  if (!data) return c.json({ loading: true }, 503);
+  const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
+  return c.json(getModelUsage(sessions));
 });
 
 app.get('/api/charts/hourly', (c) => {

@@ -371,17 +371,35 @@ export function getHeatmapData(sessions: Session[]): { date: string; hour: numbe
   });
 }
 
-export function getModelStats(sessions: Session[]): Record<string, number> {
-  const result: Record<string, number> = {};
-  for (const s of sessions) {
-    // Empty/missing model = GLM 5.2 proxy session (see core pricing).
-    const model = s.model || 'GLM 5.2';
-    result[model] = (result[model] || 0) + s.cost;
+export interface UsageStat {
+  cost: number;
+  sessions: number;
+  tokens: number;
+}
+
+function getUsageStats(sessions: Session[], keyFor: (session: Session) => string): Record<string, UsageStat> {
+  const result: Record<string, UsageStat> = {};
+  for (const session of sessions) {
+    const usage = result[keyFor(session)] ||= { cost: 0, sessions: 0, tokens: 0 };
+    usage.cost += session.cost;
+    usage.sessions++;
+    usage.tokens += session.input_tokens + session.output_tokens + session.cache_read + session.cache_write;
   }
-  for (const key of Object.keys(result)) {
-    result[key] = parseFloat(result[key].toFixed(2));
-  }
+  for (const usage of Object.values(result)) usage.cost = parseFloat(usage.cost.toFixed(2));
   return result;
+}
+
+function usageCosts(usage: Record<string, UsageStat>): Record<string, number> {
+  return Object.fromEntries(Object.entries(usage).map(([key, value]) => [key, value.cost]));
+}
+
+export function getModelUsage(sessions: Session[]): Record<string, UsageStat> {
+  // Empty/missing model = GLM 5.2 proxy session (see core pricing).
+  return getUsageStats(sessions, session => session.model || 'GLM 5.2');
+}
+
+export function getModelStats(sessions: Session[]): Record<string, number> {
+  return usageCosts(getModelUsage(sessions));
 }
 
 export interface HourlyStat {
@@ -506,24 +524,9 @@ export function getCacheStats(sessions: Session[]): CacheStats {
 }
 
 export function getSourceStats(sessions: Session[]): Record<string, number> {
-  const result: Record<string, number> = {};
-  for (const s of sessions) {
-    result[s.source] = (result[s.source] || 0) + s.cost;
-  }
-  for (const key of Object.keys(result)) {
-    result[key] = parseFloat(result[key].toFixed(2));
-  }
-  return result;
+  return usageCosts(getSourceUsage(sessions));
 }
 
-export function getSourceUsage(sessions: Session[]): Record<string, { cost: number; sessions: number; tokens: number }> {
-  const result: Record<string, { cost: number; sessions: number; tokens: number }> = {};
-  for (const s of sessions) {
-    const source = result[s.source] ||= { cost: 0, sessions: 0, tokens: 0 };
-    source.cost += s.cost;
-    source.sessions++;
-    source.tokens += s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
-  }
-  for (const source of Object.values(result)) source.cost = parseFloat(source.cost.toFixed(2));
-  return result;
+export function getSourceUsage(sessions: Session[]): Record<string, UsageStat> {
+  return getUsageStats(sessions, session => session.source);
 }
