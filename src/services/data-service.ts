@@ -136,12 +136,13 @@ export function getSessionById(sessions: Session[], id: string): Session | undef
   return sessions.find(s => s.sessionId === id);
 }
 
-export function getProjectStats(sessions: Session[]): { cwd: string; cost: number; sessions: number; sources: string[]; models: string[] }[] {
-  const map: Record<string, { cost: number; sessions: number; sources: Set<string>; models: Set<string> }> = {};
+export function getProjectStats(sessions: Session[]): { cwd: string; cost: number; tokens: number; sessions: number; sources: string[]; models: string[] }[] {
+  const map: Record<string, { cost: number; tokens: number; sessions: number; sources: Set<string>; models: Set<string> }> = {};
   for (const s of sessions) {
     const key = s.cwd || '(no project)';
-    if (!map[key]) map[key] = { cost: 0, sessions: 0, sources: new Set(), models: new Set() };
+    if (!map[key]) map[key] = { cost: 0, tokens: 0, sessions: 0, sources: new Set(), models: new Set() };
     map[key].cost += s.cost;
+    map[key].tokens += s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
     map[key].sessions++;
     map[key].sources.add(s.source);
     if (s.model) map[key].models.add(s.model);
@@ -150,6 +151,7 @@ export function getProjectStats(sessions: Session[]): { cwd: string; cost: numbe
     .map(([cwd, data]) => ({
       cwd,
       cost: parseFloat(data.cost.toFixed(2)),
+      tokens: data.tokens,
       sessions: data.sessions,
       sources: [...data.sources],
       models: [...data.models],
