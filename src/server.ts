@@ -398,10 +398,11 @@ app.post('/api/collect', (c) => {
 const app = createApp();
 
 const port = parseInt(process.env.PORT || '3001');
+const hostname = process.env.HOST || '127.0.0.1';
 
 if (process.env.NODE_ENV !== 'test') {
   // Start server immediately, collect data in background
   startBackgroundCollect();
-  console.log(`Claude Stats API running on http://localhost:${port}`);
-  serve({ fetch: app.fetch, port });
+  console.log(`Claude Stats API running on http://${hostname}:${port}`);
+  serve({ fetch: app.fetch, port, hostname });
 }
