@@ -2,7 +2,7 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 
 const DEFAULT_AUTH_ISSUER = 'auth.marketmaker.cc';
 const DEFAULT_AUTH_JWKS_URL = 'https://auth.marketmaker.cc/.well-known/jwks.json';
-const DEFAULT_AUTH_SERVICE = 'harness-analyzer';
+export const DEFAULT_AUTH_SERVICE = 'harness-analyzer';
 
 export interface AuthIdentity {
   subject: string;
@@ -32,19 +32,15 @@ function readServices(payload: JWTPayload): Record<string, string> {
 export function createAuthVerifier(options: {
   jwksUrl?: string;
   issuer?: string;
-  service?: string;
 } = {}): AuthVerifier {
   const jwks = createRemoteJWKSet(new URL(options.jwksUrl || process.env.AUTH_JWKS_URL || DEFAULT_AUTH_JWKS_URL));
   const issuer = options.issuer || process.env.AUTH_ISSUER || DEFAULT_AUTH_ISSUER;
-  const service = options.service || process.env.AUTH_SERVICE_NAME || DEFAULT_AUTH_SERVICE;
-
   return async (token: string) => {
     const { payload } = await jwtVerify(token, jwks, {
       algorithms: ['RS256'],
       issuer,
     });
     const services = readServices(payload);
-    if (services[service] !== 'admin') throw new ForbiddenError();
     if (!payload.sub) throw new Error('JWT subject is missing');
     return {
       subject: payload.sub,
@@ -56,3 +52,11 @@ export function createAuthVerifier(options: {
 }
 
 export const verifyHarnessAccess = createAuthVerifier();
+
+export function hasHarnessRole(
+  identity: AuthIdentity,
+  allowedRoles: readonly string[],
+  service = process.env.AUTH_SERVICE_NAME || DEFAULT_AUTH_SERVICE,
+): boolean {
+  return allowedRoles.includes(identity.services[service]);
+}

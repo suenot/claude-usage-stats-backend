@@ -61,5 +61,9 @@ test('status remains available without authentication', async () => {
   const response = await app.request('/api/status');
 
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ready: true });
+  assert.deepEqual(await response.json(), {
+    ready: true,
+    collector_ready: true,
+    profile_storage_ready: true,
+  });
 });

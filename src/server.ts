@@ -1,7 +1,9 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
-import { ForbiddenError, verifyHarnessAccess, type AuthVerifier } from './auth.js';
+import { createHash } from 'node:crypto';
+import { ForbiddenError, hasHarnessRole, verifyHarnessAccess, type AuthIdentity, type AuthVerifier } from './auth.js';
 import {
   getData, refreshData, filterSessions, getSessionById,
   getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getModelUsage, getSourceStats, getSourceUsage,
@@ -9,6 +11,17 @@ import {
   isReady, startBackgroundCollect,
 } from './services/data-service.js';
 import { modelPricingService } from './services/model-pricing-service.js';
+import {
+  createProfileStoreFromEnv,
+  HandleConflictError,
+  InvalidHandleError,
+  normalizeHandle,
+  StaleSnapshotError,
+  type LeaderboardMetric,
+  type ProfileStore,
+  type ShareVisibility,
+} from './profile-store.js';
+import { buildPublicSnapshot, InvalidSnapshotError, validatePublicSnapshot } from './public-snapshot.js';
 
 type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
 
@@ -31,13 +44,24 @@ export function createApp(options: {
   dataProvider?: typeof getData;
   authVerifier?: AuthVerifier;
   allowedOrigins?: string[];
+  profileStore?: ProfileStore;
+  snapshotExportEnabled?: boolean;
+  snapshotExportOwnerSubject?: string;
 } = {}) {
   const ready = options.isReady ?? isReady;
   const pricing = options.modelPricingService ?? modelPricingService;
   const dataProvider = options.dataProvider ?? getData;
   const authVerifier = options.authVerifier ?? verifyHarnessAccess;
+  const profileStore = options.profileStore ?? createProfileStoreFromEnv();
+  const profileStoreReady = profileStore.init().then(() => true, () => false);
+  const snapshotExportEnabled = options.snapshotExportEnabled ?? (
+    process.env.SNAPSHOT_EXPORT_ENABLED !== undefined
+      ? process.env.SNAPSHOT_EXPORT_ENABLED === 'true'
+      : process.env.NODE_ENV !== 'production'
+  );
+  const snapshotExportOwnerSubject = options.snapshotExportOwnerSubject ?? process.env.SNAPSHOT_EXPORT_OWNER_SUBJECT;
   const allowedOrigins = new Set(options.allowedOrigins ?? configuredOrigins());
-  const app = new Hono();
+  const app = new Hono<{ Variables: { identity: AuthIdentity } }>();
 
   app.use('/api/*', async (c, next) => {
     await next();
@@ -49,18 +73,28 @@ export function createApp(options: {
   app.use('/api/*', cors({
     origin: origin => allowedOrigins.has(origin) ? origin : '',
     allowHeaders: ['Authorization', 'Content-Type'],
-    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'],
     maxAge: 600,
   }));
 
+  app.use('/api/me/public-snapshot', bodyLimit({
+    maxSize: 1_000_000,
+    onError: c => c.json({ error: 'Snapshot is too large' }, 413),
+  }));
+
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/status') return next();
+    if (c.req.path === '/api/status' || c.req.path.startsWith('/api/public/')) return next();
     const authorization = c.req.header('Authorization') || '';
     if (!authorization.startsWith('Bearer ')) {
       return c.json({ error: 'Authentication required' }, 401);
     }
     try {
-      await authVerifier(authorization.slice('Bearer '.length).trim());
+      const identity = await authVerifier(authorization.slice('Bearer '.length).trim());
+      c.set('identity', identity);
+      const allowed = c.req.path.startsWith('/api/me/')
+        ? hasHarnessRole(identity, ['user', 'superuser', 'admin'])
+        : hasHarnessRole(identity, ['admin']);
+      if (!allowed) return c.json({ error: 'Forbidden' }, 403);
     } catch (error) {
       if (error instanceof ForbiddenError) return c.json({ error: 'Forbidden' }, 403);
       return c.json({ error: 'Invalid or expired token' }, 401);
@@ -70,14 +104,155 @@ export function createApp(options: {
 
   // Return 503 while data is loading
   app.use('/api/*', async (c, next) => {
-    if (!ready() && c.req.path !== '/api/status' && c.req.path !== '/api/models/pricing') {
+    const independent = c.req.path === '/api/status' || c.req.path.startsWith('/api/public/') ||
+      c.req.path === '/api/models/pricing' || c.req.path === '/api/me/sharing' ||
+      c.req.path === '/api/me/public-snapshot';
+    if (!ready() && !independent) {
       return c.json({ loading: true, message: 'Collecting data, please wait...' }, 503);
     }
     return next();
   });
 
-  app.get('/api/status', (c) => {
-    return c.json({ ready: ready() });
+  app.get('/api/status', async (c) => {
+    const profileStorageReady = await profileStoreReady;
+    const collectorReady = ready();
+    return c.json({
+      ready: collectorReady && profileStorageReady,
+      collector_ready: collectorReady,
+      profile_storage_ready: profileStorageReady,
+    });
+  });
+
+  const waitForProfileStore = async () => {
+    return profileStoreReady;
+  };
+
+  const ensureSharing = async (identity: AuthIdentity) => {
+    const existing = await profileStore.getSharing(identity.subject);
+    if (existing) return existing;
+    let preferred: string;
+    try {
+      preferred = normalizeHandle(identity.username || 'user');
+    } catch {
+      preferred = 'user';
+    }
+    try {
+      return await profileStore.upsertSharing(identity.subject, {
+        handle: preferred,
+        display_name: identity.username || null,
+        visibility: 'private',
+        leaderboard_opt_in: false,
+      });
+    } catch (error) {
+      if (!(error instanceof HandleConflictError)) throw error;
+      const suffix = createHash('sha256').update(identity.subject).digest('hex').slice(0, 6);
+      const base = preferred.slice(0, 40 - suffix.length - 1).replace(/-+$/, '') || 'user';
+      return profileStore.upsertSharing(identity.subject, {
+        handle: `${base}-${suffix}`,
+        display_name: identity.username || null,
+        visibility: 'private',
+        leaderboard_opt_in: false,
+      });
+    }
+  };
+
+  const sharingResponse = ({ subject: _subject, ...profile }: Awaited<ReturnType<typeof ensureSharing>>) => profile;
+
+  app.get('/api/public/users/:handle', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const profile = await profileStore.getPublicProfile(c.req.param('handle'));
+    if (!profile) return c.json({ error: 'Not found' }, 404);
+    return c.json(profile);
+  });
+
+  app.get('/api/public/leaderboard', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const metric = c.req.query('metric') || 'tokens';
+    if (!['tokens', 'cost', 'sessions'].includes(metric)) return c.json({ error: 'Invalid metric' }, 400);
+    const rawLimit = Number(c.req.query('limit') || '50');
+    if (!Number.isInteger(rawLimit) || rawLimit < 1) return c.json({ error: 'Invalid limit' }, 400);
+    const limit = Math.min(rawLimit, 100);
+    const users = await profileStore.getLeaderboard(metric as LeaderboardMetric, limit);
+    return c.json({
+      metric,
+      self_reported: true,
+      users: users.map((user, index) => ({ rank: index + 1, ...user })),
+    });
+  });
+
+  app.get('/api/me/sharing', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    return c.json(sharingResponse(await ensureSharing(c.get('identity'))));
+  });
+
+  app.put('/api/me/sharing', async (c) => {
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid body' }, 400);
+    }
+    const allowedKeys = new Set(['handle', 'display_name', 'visibility', 'leaderboard_opt_in']);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowedKeys.has(key))) {
+      return c.json({ error: 'Invalid body' }, 400);
+    }
+    const current = await ensureSharing(c.get('identity'));
+    if (body.handle !== undefined && typeof body.handle !== 'string') return c.json({ error: 'Invalid handle' }, 400);
+    if (body.display_name !== undefined && body.display_name !== null &&
+        (typeof body.display_name !== 'string' || body.display_name.length > 80 || /[\u0000-\u001f\u007f]/.test(body.display_name))) {
+      return c.json({ error: 'Invalid display name' }, 400);
+    }
+    if (body.visibility !== undefined && !['private', 'totals', 'details'].includes(String(body.visibility))) {
+      return c.json({ error: 'Invalid visibility' }, 400);
+    }
+    if (body.leaderboard_opt_in !== undefined && typeof body.leaderboard_opt_in !== 'boolean') {
+      return c.json({ error: 'Invalid leaderboard preference' }, 400);
+    }
+    try {
+      const profile = await profileStore.upsertSharing(c.get('identity').subject, {
+        handle: body.handle === undefined ? current.handle : body.handle as string,
+        display_name: body.display_name as string | null | undefined,
+        visibility: body.visibility as ShareVisibility | undefined,
+        leaderboard_opt_in: body.leaderboard_opt_in as boolean | undefined,
+      });
+      return c.json(sharingResponse(profile));
+    } catch (error) {
+      if (error instanceof HandleConflictError) return c.json({ error: error.message }, 409);
+      if (error instanceof InvalidHandleError) return c.json({ error: error.message }, 400);
+      throw error;
+    }
+  });
+
+  app.put('/api/me/public-snapshot', async (c) => {
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const identity = c.get('identity');
+    if (!await profileStore.getSharing(identity.subject)) return c.json({ error: 'Create sharing profile first' }, 409);
+    try {
+      const snapshot = validatePublicSnapshot(await c.req.json());
+      await profileStore.saveSnapshot(identity.subject, snapshot);
+      return c.json({ ok: true, generated_at: snapshot.generated_at });
+    } catch (error) {
+      if (error instanceof InvalidSnapshotError) return c.json({ error: error.message }, 400);
+      if (error instanceof StaleSnapshotError) return c.json({ error: error.message }, 409);
+      if (error instanceof SyntaxError) return c.json({ error: 'Invalid body' }, 400);
+      throw error;
+    }
+  });
+
+  app.get('/api/me/public-snapshot-source', (c) => {
+    const identity = c.get('identity');
+    if (!snapshotExportEnabled && (!snapshotExportOwnerSubject || identity.subject !== snapshotExportOwnerSubject)) {
+      return c.json({ error: 'Snapshot export is disabled' }, 403);
+    }
+    const level = c.req.query('level') || 'totals';
+    if (level !== 'totals' && level !== 'details') return c.json({ error: 'Invalid level' }, 400);
+    const data = dataProvider();
+    if (!data) return c.json({ loading: true }, 503);
+    return c.json(buildPublicSnapshot(data.sessions, level));
   });
 
   app.get('/api/models/pricing', async (c) => {
@@ -92,13 +267,13 @@ export function createApp(options: {
   });
 
 app.get('/api/summary', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   return c.json(data.summary);
 });
 
 app.get('/api/sessions', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const filtered = filterSessions(data.sessions, {
     source: c.req.query('source'),
@@ -117,7 +292,7 @@ app.get('/api/sessions', (c) => {
 });
 
 app.get('/api/sessions/:id', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const session = getSessionById(data.sessions, c.req.param('id'));
   if (!session) return c.json({ error: 'Not found' }, 404);
@@ -125,27 +300,27 @@ app.get('/api/sessions/:id', (c) => {
 });
 
 app.get('/api/projects', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   return c.json(getProjectStats(data.sessions));
 });
 
 app.get('/api/charts/daily', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const days = parseInt(c.req.query('days') || '30');
   return c.json(getDailyChart(data.sessions, days));
 });
 
 app.get('/api/charts/daily-models', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const days = parseInt(c.req.query('days') || '30');
   return c.json(getDailyModelChart(data.sessions, days));
 });
 
 app.get('/api/charts/history', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const timeframe = c.req.query('timeframe') === '1h' ? '1h' : '1d';
   const groupBy = c.req.query('groupBy') === 'model' ? 'model' : 'harness';
@@ -155,49 +330,49 @@ app.get('/api/charts/history', (c) => {
 });
 
 app.get('/api/charts/heatmap', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getHeatmapData(sessions));
 });
 
 app.get('/api/charts/sources', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getSourceStats(sessions));
 });
 
 app.get('/api/charts/source-usage', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getSourceUsage(sessions));
 });
 
 app.get('/api/charts/models', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getModelStats(sessions));
 });
 
 app.get('/api/charts/model-usage', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getModelUsage(sessions));
 });
 
 app.get('/api/charts/hourly', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getHourlyStats(sessions));
 });
 
 app.get('/api/charts/cache', (c) => {
-  const data = getData();
+  const data = dataProvider();
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getCacheStats(sessions));
