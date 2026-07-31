@@ -16,6 +16,7 @@ test('pricing route bypasses readiness and forwards refresh=1 as force=true', as
   let receivedOptions;
   const app = createApp({
     isReady: () => false,
+    authVerifier: async () => ({ subject: 'test-user', services: { 'harness-analyzer': 'admin' } }),
     modelPricingService: {
       getModelPricing: async options => {
         receivedOptions = options;
@@ -24,7 +25,9 @@ test('pricing route bypasses readiness and forwards refresh=1 as force=true', as
     },
   });
 
-  const response = await app.request('/api/models/pricing?refresh=1');
+  const response = await app.request('/api/models/pricing?refresh=1', {
+    headers: { Authorization: 'Bearer test-token' },
+  });
 
   assert.equal(response.status, 200);
   assert.deepEqual(receivedOptions, { force: true });
@@ -34,12 +37,15 @@ test('pricing route bypasses readiness and forwards refresh=1 as force=true', as
 test('pricing route returns 502 when the first upstream request fails', async () => {
   const app = createApp({
     isReady: () => false,
+    authVerifier: async () => ({ subject: 'test-user', services: { 'harness-analyzer': 'admin' } }),
     modelPricingService: {
       getModelPricing: async () => { throw new Error('OpenRouter is unavailable'); },
     },
   });
 
-  const response = await app.request('/api/models/pricing');
+  const response = await app.request('/api/models/pricing', {
+    headers: { Authorization: 'Bearer test-token' },
+  });
 
   assert.equal(response.status, 502);
   assert.deepEqual(await response.json(), { error: 'OpenRouter pricing is unavailable' });

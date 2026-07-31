@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { ForbiddenError, verifyHarnessAccess, type AuthVerifier } from './auth.js';
 import {
   getData, refreshData, filterSessions, getSessionById,
   getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getModelUsage, getSourceStats, getSourceUsage,
@@ -11,17 +12,61 @@ import { modelPricingService } from './services/model-pricing-service.js';
 
 type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
 
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://harness-analyzer.marketmaker.cc',
+  'http://127.0.0.1:5173',
+  'http://localhost:5173',
+];
+
+function configuredOrigins(): string[] {
+  return (process.env.CORS_ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+}
+
 export function createApp(options: {
   isReady?: typeof isReady;
   modelPricingService?: PricingService;
   dataProvider?: typeof getData;
+  authVerifier?: AuthVerifier;
+  allowedOrigins?: string[];
 } = {}) {
   const ready = options.isReady ?? isReady;
   const pricing = options.modelPricingService ?? modelPricingService;
   const dataProvider = options.dataProvider ?? getData;
+  const authVerifier = options.authVerifier ?? verifyHarnessAccess;
+  const allowedOrigins = new Set(options.allowedOrigins ?? configuredOrigins());
   const app = new Hono();
 
-  app.use('*', cors());
+  app.use('/api/*', async (c, next) => {
+    await next();
+    if (c.req.header('Access-Control-Request-Private-Network') === 'true') {
+      c.header('Access-Control-Allow-Private-Network', 'true');
+    }
+  });
+
+  app.use('/api/*', cors({
+    origin: origin => allowedOrigins.has(origin) ? origin : '',
+    allowHeaders: ['Authorization', 'Content-Type'],
+    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    maxAge: 600,
+  }));
+
+  app.use('/api/*', async (c, next) => {
+    if (c.req.path === '/api/status') return next();
+    const authorization = c.req.header('Authorization') || '';
+    if (!authorization.startsWith('Bearer ')) {
+      return c.json({ error: 'Authentication required' }, 401);
+    }
+    try {
+      await authVerifier(authorization.slice('Bearer '.length).trim());
+    } catch (error) {
+      if (error instanceof ForbiddenError) return c.json({ error: 'Forbidden' }, 403);
+      return c.json({ error: 'Invalid or expired token' }, 401);
+    }
+    return next();
+  });
 
   // Return 503 while data is loading
   app.use('/api/*', async (c, next) => {

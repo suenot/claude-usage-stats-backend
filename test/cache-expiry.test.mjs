@@ -249,10 +249,12 @@ test('cache-expiry route keeps the raw predecessor outside from', async () => {
   const app = createApp({
     isReady: () => true,
     dataProvider: () => ({ sessions: rawSessions, summary: {}, sourceResults: {} }),
+    authVerifier: async () => ({ subject: 'test-user', services: { 'harness-analyzer': 'admin' } }),
   });
 
   const response = await app.request(
     `/api/charts/cache-expiry?from=${encodeURIComponent('2026-01-02T00:00:00.000Z')}`,
+    { headers: { Authorization: 'Bearer test-token' } },
   );
   const body = await response.json();
 
