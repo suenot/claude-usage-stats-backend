@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { collect, getDirectoryFingerprint, getModelFamily, getPricing, type Session, type CollectorResult } from '@claude-stats/core';
+import { collect, getDirectoryFingerprint, getModelFamily, getPricing, type Session, type UsageEvent, type CollectorResult } from '@claude-stats/core';
 
 let cachedResult: CollectorResult | null = null;
 let lastFingerprint = '';
@@ -468,6 +468,203 @@ export interface CacheStats {
   // Share of PROMPT tokens (input + cache write + cache read) served from cache.
   hit_rate: number;
   by_model: CacheModelRow[];
+}
+
+export interface CacheExpiryBreakdown {
+  cost: number;
+  tokens: number;
+  incidents: number;
+}
+
+export interface CacheExpiryIncident {
+  timestamp: string;
+  source: string;
+  model: string;
+  session_id?: string;
+  title?: string;
+  project?: string;
+  idle_minutes: number;
+  ttl: '5m' | '1h';
+  estimated_tokens: number;
+  estimated_cost: number;
+  confidence: 'estimated';
+}
+
+export interface CacheExpiryStats {
+  methodology: 'heuristic-v1';
+  estimated_lost_cost: number;
+  estimated_expired_tokens: number;
+  incidents: number;
+  total_idle_minutes: number;
+  by_ttl: Record<'5m' | '1h', CacheExpiryBreakdown>;
+  by_model: Array<CacheExpiryBreakdown & { model: string }>;
+  top_incidents: CacheExpiryIncident[];
+  coverage: {
+    eligible_sessions: number;
+    excluded_sessions: number;
+    analyzed_events: number;
+    sources: string[];
+  };
+}
+
+function rangeTimestamp(value: string | undefined, end: boolean): number | undefined {
+  if (!value) return undefined;
+  const normalized = value.length <= 10
+    ? `${value}T${end ? '23:59:59.999' : '00:00:00.000'}`
+    : value.length === 16 && end
+      ? `${value}:59.999`
+      : value;
+  const timestamp = new Date(normalized).getTime();
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function timestampInRange(timestamp: number, from?: number, to?: number): boolean {
+  return Number.isFinite(timestamp) &&
+    (from === undefined || timestamp >= from) &&
+    (to === undefined || timestamp <= to);
+}
+
+// Estimates cache re-write cost after an inactivity gap. Only explicit Claude
+// 5m/1h write counters qualify; a write can also be caused by changed prompt
+// content, so the API labels this counterfactual as heuristic-v1.
+export function getCacheExpiryStats(
+  sessions: Session[],
+  range: { from?: string; to?: string } = {},
+): CacheExpiryStats {
+  const from = rangeTimestamp(range.from, false);
+  const to = rangeTimestamp(range.to, true);
+  const byTtl: CacheExpiryStats['by_ttl'] = {
+    '5m': { cost: 0, tokens: 0, incidents: 0 },
+    '1h': { cost: 0, tokens: 0, incidents: 0 },
+  };
+  const byModel: Record<string, CacheExpiryBreakdown> = {};
+  const incidents: CacheExpiryIncident[] = [];
+  const groups = new Map<string, Array<{ event: UsageEvent; session: Session }>>();
+  const sessionGroupKeys = new Map<Session, string>();
+  const eligibleSources = new Set<string>();
+  let totalIdleMinutes = 0;
+
+  for (const session of sessions) {
+    if (!session.events?.length) continue;
+    const key = `${session.source}|${session.sessionId || session.file}`;
+    sessionGroupKeys.set(session, key);
+    const group = groups.get(key) || [];
+    for (const event of session.events) {
+      group.push({ event, session });
+    }
+    groups.set(key, group);
+  }
+
+  const eligibleGroupKeys = new Set(
+    [...groups.entries()]
+      .filter(([, group]) => group.some(({ event }) => event.cache_write_5m > 0 || event.cache_write_1h > 0))
+      .map(([key]) => key),
+  );
+  const selectedSessions = sessions.filter(session => {
+    if (session.events?.length) {
+      return session.events.some(event => timestampInRange(event.timestamp_ms, from, to));
+    }
+    const timestamp = new Date(`${session.date}T${session.time || '00:00'}`).getTime();
+    return timestampInRange(timestamp, from, to);
+  });
+  const eligibleSessions = selectedSessions
+    .filter(session => {
+      const key = sessionGroupKeys.get(session);
+      return key !== undefined && eligibleGroupKeys.has(key);
+    });
+  const analyzedEvents = eligibleSessions.reduce(
+    (sum, session) => sum + (session.events?.filter(event => timestampInRange(event.timestamp_ms, from, to)).length || 0),
+    0,
+  );
+  for (const session of eligibleSessions) eligibleSources.add(session.source);
+
+  for (const [key, group] of groups) {
+    if (!eligibleGroupKeys.has(key)) continue;
+    group.sort((a, b) => a.event.timestamp_ms - b.event.timestamp_ms);
+    for (let index = 1; index < group.length; index++) {
+      const previous = group[index - 1];
+      const current = group[index];
+      if (current.event.model !== previous.event.model) continue;
+      if ((from !== undefined && current.event.timestamp_ms < from) ||
+          (to !== undefined && current.event.timestamp_ms > to)) continue;
+
+      const gapMs = current.event.timestamp_ms - previous.event.timestamp_ms;
+      if (gapMs <= 0) continue;
+      const expired5m = gapMs > 5 * 60_000 ? current.event.cache_write_5m : 0;
+      const expired1h = gapMs > 60 * 60_000 ? current.event.cache_write_1h : 0;
+      const expiredTotal = expired5m + expired1h;
+      const previousCacheable = previous.event.cache_read + previous.event.cache_write;
+      if (expiredTotal <= 0 || previousCacheable <= 0) continue;
+
+      const cappedTotal = Math.min(expiredTotal, previousCacheable);
+      const estimated5m = Math.round(cappedTotal * expired5m / expiredTotal);
+      const estimated1h = cappedTotal - estimated5m;
+      const pricing = getPricing(current.event.model);
+      const idleMinutes = gapMs / 60_000;
+      totalIdleMinutes += idleMinutes;
+
+      for (const [ttl, tokens, writePrice] of [
+        ['5m', estimated5m, pricing.cacheWrite],
+        ['1h', estimated1h, pricing.cacheWrite1h],
+      ] as const) {
+        if (tokens <= 0) continue;
+        const cost = Math.max(0, writePrice - pricing.cacheRead) * tokens / 1_000_000;
+        const model = current.event.model || 'Unknown';
+        const row = (byModel[model] ||= { cost: 0, tokens: 0, incidents: 0 });
+        byTtl[ttl].cost += cost;
+        byTtl[ttl].tokens += tokens;
+        byTtl[ttl].incidents++;
+        row.cost += cost;
+        row.tokens += tokens;
+        row.incidents++;
+        incidents.push({
+          timestamp: new Date(current.event.timestamp_ms).toISOString(),
+          source: current.session.source,
+          model,
+          session_id: current.session.sessionId,
+          title: current.session.title,
+          project: current.session.cwd,
+          idle_minutes: idleMinutes,
+          ttl,
+          estimated_cost: cost,
+          estimated_tokens: tokens,
+          confidence: 'estimated',
+        });
+      }
+    }
+  }
+
+  const roundCost = (value: number) => parseFloat(value.toFixed(4));
+  const roundIdle = (value: number) => parseFloat(value.toFixed(1));
+  for (const row of Object.values(byTtl)) row.cost = roundCost(row.cost);
+  const byModelRows = Object.entries(byModel)
+    .map(([model, row]) => ({ ...row, model, cost: roundCost(row.cost) }))
+    .sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
+  const topIncidents = incidents
+    .sort((a, b) => b.estimated_cost - a.estimated_cost || b.estimated_tokens - a.estimated_tokens)
+    .slice(0, 10)
+    .map(incident => ({
+      ...incident,
+      estimated_cost: roundCost(incident.estimated_cost),
+      idle_minutes: roundIdle(incident.idle_minutes),
+    }));
+
+  return {
+    methodology: 'heuristic-v1',
+    estimated_lost_cost: roundCost(byTtl['5m'].cost + byTtl['1h'].cost),
+    estimated_expired_tokens: byTtl['5m'].tokens + byTtl['1h'].tokens,
+    incidents: byTtl['5m'].incidents + byTtl['1h'].incidents,
+    total_idle_minutes: roundIdle(totalIdleMinutes),
+    by_ttl: byTtl,
+    by_model: byModelRows,
+    top_incidents: topIncidents,
+    coverage: {
+      eligible_sessions: eligibleSessions.length,
+      excluded_sessions: selectedSessions.length - eligibleSessions.length,
+      analyzed_events: analyzedEvents,
+      sources: [...eligibleSources].sort(),
+    },
+  };
 }
 
 // What prompt caching is worth. The counterfactual: without a cache every

@@ -4,7 +4,7 @@ import { cors } from 'hono/cors';
 import {
   getData, refreshData, filterSessions, getSessionById,
   getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getModelUsage, getSourceStats, getSourceUsage,
-  getHourlyStats, getCacheStats,
+  getHourlyStats, getCacheStats, getCacheExpiryStats,
   isReady, startBackgroundCollect,
 } from './services/data-service.js';
 import { modelPricingService } from './services/model-pricing-service.js';
@@ -14,9 +14,11 @@ type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
 export function createApp(options: {
   isReady?: typeof isReady;
   modelPricingService?: PricingService;
+  dataProvider?: typeof getData;
 } = {}) {
   const ready = options.isReady ?? isReady;
   const pricing = options.modelPricingService ?? modelPricingService;
+  const dataProvider = options.dataProvider ?? getData;
   const app = new Hono();
 
   app.use('*', cors());
@@ -154,6 +156,15 @@ app.get('/api/charts/cache', (c) => {
   if (!data) return c.json({ loading: true }, 503);
   const sessions = filterSessions(data.sessions, { from: c.req.query('from'), to: c.req.query('to') });
   return c.json(getCacheStats(sessions));
+});
+
+app.get('/api/charts/cache-expiry', (c) => {
+  const data = dataProvider();
+  if (!data) return c.json({ loading: true }, 503);
+  return c.json(getCacheExpiryStats(data.sessions, {
+    from: c.req.query('from'),
+    to: c.req.query('to'),
+  }));
 });
 
 app.post('/api/collect', (c) => {
