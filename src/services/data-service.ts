@@ -1,5 +1,38 @@
 import * as path from 'node:path';
-import { collect, getDirectoryFingerprint, getModelFamily, getPricing, type Session, type UsageEvent, type CollectorResult } from '@claude-stats/core';
+import { collect, getDirectoryFingerprint, type CollectorResult } from '@claude-stats/core';
+
+export {
+  filterSessions,
+  getSessionById,
+  getProjectStats,
+  formatLocalDay,
+  getHistoryChart,
+  getDailyChart,
+  getDailyModelChart,
+  getHeatmapData,
+  getModelUsage,
+  getModelStats,
+  getHourlyStats,
+  getCacheExpiryStats,
+  getCacheStats,
+  getSourceStats,
+  getSourceUsage,
+} from '@claude-stats/core';
+export type {
+  ProjectEntry,
+  HistoryTimeframe,
+  HistoryGroupBy,
+  HistoryValue,
+  HistoryBucket,
+  HistoryChart,
+  UsageStat,
+  HourlyStat,
+  CacheModelRow,
+  CacheStats,
+  CacheExpiryBreakdown,
+  CacheExpiryIncident,
+  CacheExpiryStats,
+} from '@claude-stats/core';
 
 let cachedResult: CollectorResult | null = null;
 let lastFingerprint = '';
@@ -12,20 +45,17 @@ const WATCHED_DIRS = [
 ];
 
 function computeFingerprint(): string {
-  let fp = '';
-  for (const dir of WATCHED_DIRS) {
-    fp += getDirectoryFingerprint(dir) + '||';
-  }
-  return fp;
+  let fingerprint = '';
+  for (const dir of WATCHED_DIRS) fingerprint += getDirectoryFingerprint(dir) + '||';
+  return fingerprint;
 }
 
 function collectSync(): CollectorResult {
   const start = Date.now();
   console.log(cachedResult ? 'Files changed, re-collecting...' : 'Collecting data...');
   const result = collect();
-  const fp = computeFingerprint();
   cachedResult = result;
-  lastFingerprint = fp;
+  lastFingerprint = computeFingerprint();
   console.log(`Loaded ${result.sessions.length} sessions in ${Date.now() - start}ms`);
   return result;
 }
@@ -37,7 +67,6 @@ export function isReady(): boolean {
 export function startBackgroundCollect(): void {
   if (collecting) return;
   collecting = true;
-  // Run in next tick so server can start immediately
   setImmediate(() => {
     collectSync();
     collecting = false;
@@ -46,684 +75,11 @@ export function startBackgroundCollect(): void {
 
 export function getData(): CollectorResult | null {
   if (!cachedResult) return null;
-  // Check fingerprint — only re-stat files, don't re-parse
-  const fp = computeFingerprint();
-  if (fp !== lastFingerprint) {
-    collectSync();
-  }
-  return cachedResult!;
+  if (computeFingerprint() !== lastFingerprint) collectSync();
+  return cachedResult;
 }
 
 export function refreshData(): CollectorResult {
   lastFingerprint = '';
   return collectSync();
-}
-
-export function filterSessions(
-  sessions: Session[],
-  filters: {
-    source?: string;
-    model?: string;
-    from?: string;
-    to?: string;
-    minCost?: number;
-  },
-): Session[] {
-  let result = sessions;
-  if (filters.source) {
-    const sources = filters.source.split(',');
-    result = result.filter(s => sources.some(src => s.source.toLowerCase().includes(src.toLowerCase())));
-  }
-  if (filters.model) {
-    const models = filters.model.split(',');
-    result = result.filter(s => models.some(m => s.model.toLowerCase().includes(m.toLowerCase())));
-  }
-
-  // Date-only bounds retain whole-day semantics. Datetime bounds intersect
-  // the real hourly buckets and return a clipped copy, so every downstream
-  // aggregator sees only usage from the selected interval. Legacy sessions
-  // without hours keep their previous start-time filtering behavior.
-  if (filters.from && filters.from.length <= 10) {
-    result = result.filter(s => s.date >= filters.from!);
-  }
-  if (filters.to && filters.to.length <= 10) {
-    result = result.filter(s => s.date <= filters.to!);
-  }
-
-  const fromTime = filters.from && filters.from.length > 10 ? filters.from.slice(0, 16) : undefined;
-  const toTime = filters.to && filters.to.length > 10 ? filters.to.slice(0, 16) : undefined;
-  if (fromTime || toTime) {
-    result = result.flatMap(session => {
-      const hourEntries = Object.entries(session.hours || {});
-      if (hourEntries.length === 0) {
-        const startedAt = `${session.date}T${session.time}`.slice(0, 16);
-        return (!fromTime || startedAt >= fromTime) && (!toTime || startedAt <= toTime)
-          ? [session]
-          : [];
-      }
-
-      const hours = Object.fromEntries(hourEntries.filter(([rawHour]) => {
-        const hour = Number(rawHour);
-        if (!Number.isInteger(hour) || hour < 0 || hour > 23) return false;
-        const hourStart = `${session.date}T${String(hour).padStart(2, '0')}:00`;
-        const hourEnd = `${session.date}T${String(hour).padStart(2, '0')}:59`;
-        return (!fromTime || hourEnd >= fromTime) && (!toTime || hourStart <= toTime);
-      }));
-      const selectedHours = Object.values(hours);
-      if (selectedHours.length === 0) return [];
-
-      const totals = selectedHours.reduce(
-        (sum, usage) => ({
-          cost: sum.cost + usage.cost,
-          input_tokens: sum.input_tokens + usage.input_tokens,
-          output_tokens: sum.output_tokens + usage.output_tokens,
-          cache_read: sum.cache_read + usage.cache_read,
-          cache_write: sum.cache_write + usage.cache_write,
-        }),
-        { cost: 0, input_tokens: 0, output_tokens: 0, cache_read: 0, cache_write: 0 },
-      );
-      return [{ ...session, ...totals, hours }];
-    });
-  }
-
-  if (filters.minCost) {
-    result = result.filter(s => s.cost >= filters.minCost!);
-  }
-  return result;
-}
-
-export function getSessionById(sessions: Session[], id: string): Session | undefined {
-  return sessions.find(s => s.sessionId === id);
-}
-
-type ProjectBreakdown = Record<string, { usd: number; tokens: number; sessions: number }>;
-
-export type ProjectEntry = {
-  cwd: string;
-  cost: number;
-  tokens: number;
-  sessions: number;
-  sources: string[];
-  models: string[];
-  byModel: ProjectBreakdown;
-  byHarness: ProjectBreakdown;
-};
-
-function addProjectBreakdownUsage(breakdown: ProjectBreakdown, key: string, usd: number, tokens: number): void {
-  if (!breakdown[key]) breakdown[key] = { usd: 0, tokens: 0, sessions: 0 };
-  breakdown[key].usd += usd;
-  breakdown[key].tokens += tokens;
-  breakdown[key].sessions++;
-}
-
-function usdToCents(usd: number): number {
-  const rawCents = usd * 100;
-  return Math.round(rawCents + Number.EPSILON * Math.max(1, Math.abs(rawCents)));
-}
-
-function allocateProjectBreakdown(breakdown: ProjectBreakdown, totalCents: number): ProjectBreakdown {
-  const entries = Object.entries(breakdown).map(([key, value]) => {
-    const rawCents = value.usd * 100;
-    const cents = Math.floor(rawCents);
-    return { key, value, cents, remainder: rawCents - cents };
-  });
-  const allocatedCents = entries.reduce((sum, entry) => sum + entry.cents, 0);
-  const centsToAllocate = totalCents - allocatedCents;
-  const allocationOrder = [...entries].sort((a, b) => {
-    if (a.remainder !== b.remainder) return b.remainder - a.remainder;
-    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-  });
-  for (let i = 0; i < centsToAllocate; i++) allocationOrder[i].cents++;
-
-  return Object.fromEntries(entries.map(({ key, value, cents }) => [
-    key,
-    { ...value, usd: cents / 100 },
-  ]));
-}
-
-export function getProjectStats(sessions: Session[]): ProjectEntry[] {
-  const map: Record<string, {
-    cost: number;
-    tokens: number;
-    sessions: number;
-    byModel: ProjectBreakdown;
-    byHarness: ProjectBreakdown;
-  }> = {};
-  for (const s of sessions) {
-    const key = s.cwd || '(no project)';
-    const model = s.model || 'GLM 5.2';
-    const harness = s.source || 'Unknown';
-    const tokens = s.input_tokens + s.output_tokens + s.cache_read + s.cache_write;
-    if (!map[key]) {
-      map[key] = { cost: 0, tokens: 0, sessions: 0, byModel: {}, byHarness: {} };
-    }
-    const project = map[key];
-    project.cost += s.cost;
-    project.tokens += tokens;
-    project.sessions++;
-    addProjectBreakdownUsage(project.byModel, model, s.cost, tokens);
-    addProjectBreakdownUsage(project.byHarness, harness, s.cost, tokens);
-  }
-  return Object.entries(map)
-    .map(([cwd, data]) => {
-      const totalCents = usdToCents(data.cost);
-      const byModel = allocateProjectBreakdown(data.byModel, totalCents);
-      const byHarness = allocateProjectBreakdown(data.byHarness, totalCents);
-      return {
-        cwd,
-        cost: totalCents / 100,
-        tokens: data.tokens,
-        sessions: data.sessions,
-        sources: Object.keys(byHarness),
-        models: Object.keys(byModel),
-        byModel,
-        byHarness,
-      };
-    })
-    .sort((a, b) => b.cost - a.cost);
-}
-
-// Session dates are local wall-clock strings produced by the collector. Match
-// the runtime's configured timezone here; no fixed UTC offset is assumed.
-export function formatLocalDay(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-// Every local day string from the window start through today, inclusive.
-// days = 0 (or negative) → full history starting at `minDate`; otherwise a
-// trailing window of `days` days ending today.
-function dayGrid(minDate: string, days: number): string[] {
-  const now = new Date();
-  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-  const cur = new Date(end);
-  if (days > 0) {
-    cur.setDate(cur.getDate() - (days - 1));
-  } else {
-    const [y, m, d] = minDate.split('-').map(Number);
-    cur.setFullYear(y, m - 1, d);
-  }
-
-  const out: string[] = [];
-  for (; cur <= end; cur.setDate(cur.getDate() + 1)) out.push(formatLocalDay(cur));
-  return out;
-}
-
-export type HistoryTimeframe = '1d' | '1h';
-export type HistoryGroupBy = 'harness' | 'model';
-
-export interface HistoryValue {
-  usd: number;
-  tokens: number;
-}
-
-export interface HistoryBucket {
-  timestamp: string;
-  values: Record<string, HistoryValue>;
-}
-
-export interface HistoryChart {
-  timeframe: HistoryTimeframe;
-  groupBy: HistoryGroupBy;
-  buckets: HistoryBucket[];
-}
-
-export function getHistoryChart(
-  sessions: Session[],
-  options: { timeframe?: HistoryTimeframe; groupBy?: HistoryGroupBy; days?: number } = {},
-): HistoryChart {
-  const timeframe = options.timeframe || '1d';
-  const groupBy = options.groupBy || 'harness';
-  const days = options.days ?? 30;
-  if (sessions.length === 0) return { timeframe, groupBy, buckets: [] };
-
-  let minDate = sessions[0].date;
-  const valuesByTimestamp: Record<string, Record<string, HistoryValue>> = {};
-
-  const add = (
-    timestamp: string,
-    series: string,
-    usage: Pick<Session, 'cost' | 'input_tokens' | 'output_tokens' | 'cache_read' | 'cache_write'>,
-  ) => {
-    const values = (valuesByTimestamp[timestamp] ||= {});
-    const value = (values[series] ||= { usd: 0, tokens: 0 });
-    value.usd += usage.cost;
-    value.tokens += usage.input_tokens + usage.output_tokens + usage.cache_read + usage.cache_write;
-  };
-
-  for (const session of sessions) {
-    if (session.date < minDate) minDate = session.date;
-    const series = groupBy === 'model' ? getModelFamily(session.model) : session.source;
-
-    if (timeframe === '1d') {
-      add(session.date, series, session);
-      continue;
-    }
-
-    for (const [rawHour, usage] of Object.entries(session.hours || {})) {
-      const hour = Number(rawHour);
-      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
-      add(`${session.date}T${String(hour).padStart(2, '0')}:00`, series, usage);
-    }
-  }
-
-  let timestamps: string[];
-  if (timeframe === '1d') {
-    timestamps = dayGrid(minDate, days);
-  } else {
-    const includedDays = new Set(dayGrid(minDate, days));
-    timestamps = Object.keys(valuesByTimestamp)
-      .filter(timestamp => includedDays.has(timestamp.slice(0, 10)))
-      .sort();
-  }
-  return {
-    timeframe,
-    groupBy,
-    buckets: timestamps.map(timestamp => ({
-      timestamp,
-      values: valuesByTimestamp[timestamp] || {},
-    })),
-  };
-}
-
-export function getDailyChart(sessions: Session[], days = 30): { date: string; sources: Record<string, number> }[] {
-  return getHistoryChart(sessions, { timeframe: '1d', groupBy: 'harness', days }).buckets.map(bucket => ({
-    date: bucket.timestamp,
-    sources: Object.fromEntries(Object.entries(bucket.values).map(([series, value]) => [series, value.usd])),
-  }));
-}
-
-// Daily total cost broken down by MODEL FAMILY (Opus / Sonnet / Haiku / Fable
-// / GLM 5.2). Same windowing rules as getDailyChart: days=0 → full history.
-export function getDailyModelChart(sessions: Session[], days = 30): { date: string; models: Record<string, number>; tokens: Record<string, number> }[] {
-  const models = getHistoryChart(sessions, { timeframe: '1d', groupBy: 'model', days }).buckets;
-  const harnesses = getHistoryChart(sessions, { timeframe: '1d', groupBy: 'harness', days }).buckets;
-  return models.map((bucket, index) => ({
-    date: bucket.timestamp,
-    models: Object.fromEntries(Object.entries(bucket.values).map(([series, value]) => [series, value.usd])),
-    tokens: Object.fromEntries(Object.entries(harnesses[index]?.values || {}).map(([series, value]) => [series, value.tokens])),
-  }));
-}
-
-// Cost per (day, hour) cell. Uses the same per-message attribution as
-// getHourlyStats, so a long session lights up every hour it actually ran in
-// instead of only the cell it started in.
-export function getHeatmapData(sessions: Session[]): { date: string; hour: number; cost: number; sessions: number }[] {
-  const map: Record<string, { cost: number; sessions: number }> = {};
-  for (const s of sessions) {
-    const hours = s.hours && Object.keys(s.hours).length > 0
-      ? s.hours
-      : { [parseInt((s.time || '').split(':')[0], 10) || 0]: s };
-
-    for (const [rawHour, usage] of Object.entries(hours)) {
-      const hour = Number(rawHour);
-      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
-      const key = `${s.date}|${hour}`;
-      if (!map[key]) map[key] = { cost: 0, sessions: 0 };
-      map[key].cost += usage.cost;
-      map[key].sessions++;
-    }
-  }
-  return Object.entries(map).map(([key, data]) => {
-    const [date, hourStr] = key.split('|');
-    return { date, hour: parseInt(hourStr), cost: parseFloat(data.cost.toFixed(4)), sessions: data.sessions };
-  });
-}
-
-export interface UsageStat {
-  cost: number;
-  sessions: number;
-  tokens: number;
-}
-
-function getUsageStats(sessions: Session[], keyFor: (session: Session) => string): Record<string, UsageStat> {
-  const result: Record<string, UsageStat> = {};
-  for (const session of sessions) {
-    const usage = result[keyFor(session)] ||= { cost: 0, sessions: 0, tokens: 0 };
-    usage.cost += session.cost;
-    usage.sessions++;
-    usage.tokens += session.input_tokens + session.output_tokens + session.cache_read + session.cache_write;
-  }
-  for (const usage of Object.values(result)) usage.cost = parseFloat(usage.cost.toFixed(2));
-  return result;
-}
-
-function usageCosts(usage: Record<string, UsageStat>): Record<string, number> {
-  return Object.fromEntries(Object.entries(usage).map(([key, value]) => [key, value.cost]));
-}
-
-export function getModelUsage(sessions: Session[]): Record<string, UsageStat> {
-  // Empty/missing model = GLM 5.2 proxy session (see core pricing).
-  return getUsageStats(sessions, session => session.model || 'GLM 5.2');
-}
-
-export function getModelStats(sessions: Session[]): Record<string, number> {
-  return usageCosts(getModelUsage(sessions));
-}
-
-export interface HourlyStat {
-  hour: number;
-  cost: number;
-  // Sessions ACTIVE during this hour. A session spanning 09:00-14:00 counts in
-  // all six hours, so this column sums to more than the session total.
-  sessions: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read: number;
-  cache_write: number;
-}
-
-// Cost and tokens by hour-of-day (0-23) across the (already date-filtered)
-// input. Always returns all 24 hours so the chart renders a full day.
-//
-// Attribution comes from Session.hours, which the parsers build from each
-// message's own timestamp. Sessions predating that field only know their start
-// time, so they fall back to dumping their totals into that one hour — the old,
-// wrong behaviour, kept only so a stale cache degrades instead of vanishing.
-export function getHourlyStats(sessions: Session[]): HourlyStat[] {
-  const buckets: HourlyStat[] = Array.from({ length: 24 }, (_, hour) => ({
-    hour, cost: 0, sessions: 0, input_tokens: 0, output_tokens: 0, cache_read: 0, cache_write: 0,
-  }));
-
-  for (const s of sessions) {
-    const hours = s.hours && Object.keys(s.hours).length > 0
-      ? s.hours
-      : { [parseInt((s.time || '').split(':')[0], 10)]: s };
-
-    for (const [rawHour, usage] of Object.entries(hours)) {
-      const hour = Number(rawHour);
-      if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
-      const b = buckets[hour];
-      b.cost += usage.cost;
-      b.input_tokens += usage.input_tokens;
-      b.output_tokens += usage.output_tokens;
-      b.cache_read += usage.cache_read;
-      b.cache_write += usage.cache_write;
-      b.sessions++;
-    }
-  }
-
-  for (const b of buckets) b.cost = parseFloat(b.cost.toFixed(2));
-  return buckets;
-}
-
-export interface CacheModelRow {
-  model: string;
-  actual: number;
-  saved: number;
-  cache_read: number;
-  hit_rate: number;
-}
-
-export interface CacheStats {
-  actual_cost: number;
-  no_cache_cost: number;
-  saved: number;
-  saved_pct: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read: number;
-  cache_write: number;
-  // Share of PROMPT tokens (input + cache write + cache read) served from cache.
-  hit_rate: number;
-  by_model: CacheModelRow[];
-}
-
-export interface CacheExpiryBreakdown {
-  cost: number;
-  tokens: number;
-  incidents: number;
-}
-
-export interface CacheExpiryIncident {
-  timestamp: string;
-  source: string;
-  model: string;
-  session_id?: string;
-  title?: string;
-  project?: string;
-  idle_minutes: number;
-  ttl: '5m' | '1h';
-  estimated_tokens: number;
-  estimated_cost: number;
-  confidence: 'estimated';
-}
-
-export interface CacheExpiryStats {
-  methodology: 'heuristic-v1';
-  estimated_lost_cost: number;
-  estimated_expired_tokens: number;
-  incidents: number;
-  total_idle_minutes: number;
-  by_ttl: Record<'5m' | '1h', CacheExpiryBreakdown>;
-  by_model: Array<CacheExpiryBreakdown & { model: string }>;
-  top_incidents: CacheExpiryIncident[];
-  coverage: {
-    eligible_sessions: number;
-    excluded_sessions: number;
-    analyzed_events: number;
-    sources: string[];
-  };
-}
-
-function rangeTimestamp(value: string | undefined, end: boolean): number | undefined {
-  if (!value) return undefined;
-  const normalized = value.length <= 10
-    ? `${value}T${end ? '23:59:59.999' : '00:00:00.000'}`
-    : value.length === 16 && end
-      ? `${value}:59.999`
-      : value;
-  const timestamp = new Date(normalized).getTime();
-  return Number.isFinite(timestamp) ? timestamp : undefined;
-}
-
-function timestampInRange(timestamp: number, from?: number, to?: number): boolean {
-  return Number.isFinite(timestamp) &&
-    (from === undefined || timestamp >= from) &&
-    (to === undefined || timestamp <= to);
-}
-
-// Estimates cache re-write cost after an inactivity gap. Only explicit Claude
-// 5m/1h write counters qualify; a write can also be caused by changed prompt
-// content, so the API labels this counterfactual as heuristic-v1.
-export function getCacheExpiryStats(
-  sessions: Session[],
-  range: { from?: string; to?: string } = {},
-): CacheExpiryStats {
-  const from = rangeTimestamp(range.from, false);
-  const to = rangeTimestamp(range.to, true);
-  const byTtl: CacheExpiryStats['by_ttl'] = {
-    '5m': { cost: 0, tokens: 0, incidents: 0 },
-    '1h': { cost: 0, tokens: 0, incidents: 0 },
-  };
-  const byModel: Record<string, CacheExpiryBreakdown> = {};
-  const incidents: CacheExpiryIncident[] = [];
-  const groups = new Map<string, Array<{ event: UsageEvent; session: Session }>>();
-  const sessionGroupKeys = new Map<Session, string>();
-  const eligibleSources = new Set<string>();
-  let totalIdleMinutes = 0;
-
-  for (const session of sessions) {
-    if (!session.events?.length) continue;
-    const key = `${session.source}|${session.sessionId || session.file}`;
-    sessionGroupKeys.set(session, key);
-    const group = groups.get(key) || [];
-    for (const event of session.events) {
-      group.push({ event, session });
-    }
-    groups.set(key, group);
-  }
-
-  const eligibleGroupKeys = new Set(
-    [...groups.entries()]
-      .filter(([, group]) => group.some(({ event }) => event.cache_write_5m > 0 || event.cache_write_1h > 0))
-      .map(([key]) => key),
-  );
-  const selectedSessions = sessions.filter(session => {
-    if (session.events?.length) {
-      return session.events.some(event => timestampInRange(event.timestamp_ms, from, to));
-    }
-    const timestamp = new Date(`${session.date}T${session.time || '00:00'}`).getTime();
-    return timestampInRange(timestamp, from, to);
-  });
-  const eligibleSessions = selectedSessions
-    .filter(session => {
-      const key = sessionGroupKeys.get(session);
-      return key !== undefined && eligibleGroupKeys.has(key);
-    });
-  const analyzedEvents = eligibleSessions.reduce(
-    (sum, session) => sum + (session.events?.filter(event => timestampInRange(event.timestamp_ms, from, to)).length || 0),
-    0,
-  );
-  for (const session of eligibleSessions) eligibleSources.add(session.source);
-
-  for (const [key, group] of groups) {
-    if (!eligibleGroupKeys.has(key)) continue;
-    group.sort((a, b) => a.event.timestamp_ms - b.event.timestamp_ms);
-    for (let index = 1; index < group.length; index++) {
-      const previous = group[index - 1];
-      const current = group[index];
-      if (current.event.model !== previous.event.model) continue;
-      if ((from !== undefined && current.event.timestamp_ms < from) ||
-          (to !== undefined && current.event.timestamp_ms > to)) continue;
-
-      const gapMs = current.event.timestamp_ms - previous.event.timestamp_ms;
-      if (gapMs <= 0) continue;
-      const expired5m = gapMs > 5 * 60_000 ? current.event.cache_write_5m : 0;
-      const expired1h = gapMs > 60 * 60_000 ? current.event.cache_write_1h : 0;
-      const expiredTotal = expired5m + expired1h;
-      const previousCacheable = previous.event.cache_read + previous.event.cache_write;
-      if (expiredTotal <= 0 || previousCacheable <= 0) continue;
-
-      const cappedTotal = Math.min(expiredTotal, previousCacheable);
-      const estimated5m = Math.round(cappedTotal * expired5m / expiredTotal);
-      const estimated1h = cappedTotal - estimated5m;
-      const pricing = getPricing(current.event.model);
-      const idleMinutes = gapMs / 60_000;
-      totalIdleMinutes += idleMinutes;
-
-      for (const [ttl, tokens, writePrice] of [
-        ['5m', estimated5m, pricing.cacheWrite],
-        ['1h', estimated1h, pricing.cacheWrite1h],
-      ] as const) {
-        if (tokens <= 0) continue;
-        const cost = Math.max(0, writePrice - pricing.cacheRead) * tokens / 1_000_000;
-        const model = current.event.model || 'Unknown';
-        const row = (byModel[model] ||= { cost: 0, tokens: 0, incidents: 0 });
-        byTtl[ttl].cost += cost;
-        byTtl[ttl].tokens += tokens;
-        byTtl[ttl].incidents++;
-        row.cost += cost;
-        row.tokens += tokens;
-        row.incidents++;
-        incidents.push({
-          timestamp: new Date(current.event.timestamp_ms).toISOString(),
-          source: current.session.source,
-          model,
-          session_id: current.session.sessionId,
-          title: current.session.title,
-          project: current.session.cwd,
-          idle_minutes: idleMinutes,
-          ttl,
-          estimated_cost: cost,
-          estimated_tokens: tokens,
-          confidence: 'estimated',
-        });
-      }
-    }
-  }
-
-  const roundCost = (value: number) => parseFloat(value.toFixed(4));
-  const roundIdle = (value: number) => parseFloat(value.toFixed(1));
-  for (const row of Object.values(byTtl)) row.cost = roundCost(row.cost);
-  const byModelRows = Object.entries(byModel)
-    .map(([model, row]) => ({ ...row, model, cost: roundCost(row.cost) }))
-    .sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
-  const topIncidents = incidents
-    .sort((a, b) => b.estimated_cost - a.estimated_cost || b.estimated_tokens - a.estimated_tokens)
-    .slice(0, 10)
-    .map(incident => ({
-      ...incident,
-      estimated_cost: roundCost(incident.estimated_cost),
-      idle_minutes: roundIdle(incident.idle_minutes),
-    }));
-
-  return {
-    methodology: 'heuristic-v1',
-    estimated_lost_cost: roundCost(byTtl['5m'].cost + byTtl['1h'].cost),
-    estimated_expired_tokens: byTtl['5m'].tokens + byTtl['1h'].tokens,
-    incidents: byTtl['5m'].incidents + byTtl['1h'].incidents,
-    total_idle_minutes: roundIdle(totalIdleMinutes),
-    by_ttl: byTtl,
-    by_model: byModelRows,
-    top_incidents: topIncidents,
-    coverage: {
-      eligible_sessions: eligibleSessions.length,
-      excluded_sessions: selectedSessions.length - eligibleSessions.length,
-      analyzed_events: analyzedEvents,
-      sources: [...eligibleSources].sort(),
-    },
-  };
-}
-
-// What prompt caching is worth. The counterfactual: without a cache every
-// cache-read and cache-write token would have been sent as a plain input token
-// at full input price (output is unaffected either way). Priced per session
-// with that session's own model, since the cache discount differs per model.
-export function getCacheStats(sessions: Session[]): CacheStats {
-  const totals = { actual: 0, noCache: 0, input: 0, output: 0, read: 0, write: 0 };
-  const perModel: Record<string, { actual: number; noCache: number; read: number; prompt: number }> = {};
-
-  for (const s of sessions) {
-    const p = getPricing(s.model);
-    const promptTokens = s.input_tokens + s.cache_write + s.cache_read;
-    const noCache = (promptTokens * p.input + s.output_tokens * p.output) / 1_000_000;
-
-    totals.actual += s.cost;
-    totals.noCache += noCache;
-    totals.input += s.input_tokens;
-    totals.output += s.output_tokens;
-    totals.read += s.cache_read;
-    totals.write += s.cache_write;
-
-    const fam = getModelFamily(s.model);
-    const row = (perModel[fam] ||= { actual: 0, noCache: 0, read: 0, prompt: 0 });
-    row.actual += s.cost;
-    row.noCache += noCache;
-    row.read += s.cache_read;
-    row.prompt += promptTokens;
-  }
-
-  const promptTotal = totals.input + totals.write + totals.read;
-  const round = (v: number) => parseFloat(v.toFixed(2));
-
-  return {
-    actual_cost: round(totals.actual),
-    no_cache_cost: round(totals.noCache),
-    saved: round(totals.noCache - totals.actual),
-    saved_pct: totals.noCache > 0 ? round((1 - totals.actual / totals.noCache) * 100) : 0,
-    input_tokens: totals.input,
-    output_tokens: totals.output,
-    cache_read: totals.read,
-    cache_write: totals.write,
-    hit_rate: promptTotal > 0 ? round((totals.read / promptTotal) * 100) : 0,
-    by_model: Object.entries(perModel)
-      .map(([model, r]) => ({
-        model,
-        actual: round(r.actual),
-        saved: round(r.noCache - r.actual),
-        cache_read: r.read,
-        hit_rate: r.prompt > 0 ? round((r.read / r.prompt) * 100) : 0,
-      }))
-      .sort((a, b) => b.saved - a.saved),
-  };
-}
-
-export function getSourceStats(sessions: Session[]): Record<string, number> {
-  return usageCosts(getSourceUsage(sessions));
-}
-
-export function getSourceUsage(sessions: Session[]): Record<string, UsageStat> {
-  return getUsageStats(sessions, session => session.source);
 }

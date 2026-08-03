@@ -62,6 +62,12 @@ function request(token, init = {}) {
   return { ...init, headers };
 }
 
+function syncRequest(token, init = {}) {
+  const headers = new Headers(init.headers);
+  headers.set('Authorization', `Sync ${token}`);
+  return { ...init, headers };
+}
+
 function appFor(store, options = {}) {
   const identities = {
     alice: { subject: 'alice-id', username: 'alice', services: { 'harness-analyzer': 'user' } },
@@ -238,6 +244,29 @@ test('sharing and snapshot routes isolate owners and enforce private-first profi
   assert.equal((await app.request('/api/public/users/shared-user')).status, 200);
   assert.equal(await store.getSharing('bob-id') !== null, true);
   assert.equal((await store.getSharing('bob-id')).visibility, 'private');
+});
+
+test('sync tokens are scoped, replaceable, and revocable', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store);
+  const created = await app.request('/api/me/sync-token', request('alice', { method: 'POST' }));
+  assert.equal(created.status, 200);
+  const token = (await created.json()).token;
+  assert.match(token, /^ha_sync_[A-Za-z0-9_-]{40,}$/);
+
+  assert.equal((await app.request('/api/me/sharing', syncRequest(token))).status, 200);
+  assert.equal((await app.request('/api/summary', syncRequest(token))).status, 403);
+  const upload = await app.request('/api/me/public-snapshot', syncRequest(token, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(snapshot('details')),
+  }));
+  assert.equal(upload.status, 200);
+
+  const replacement = await app.request('/api/me/sync-token', request('alice', { method: 'POST' }));
+  const replacementToken = (await replacement.json()).token;
+  assert.equal((await app.request('/api/me/sharing', syncRequest(token))).status, 401);
+  assert.equal((await app.request('/api/me/sharing', syncRequest(replacementToken))).status, 200);
+  assert.equal((await app.request('/api/me/sync-token', request('alice', { method: 'DELETE' }))).status, 200);
+  assert.equal((await app.request('/api/me/sharing', syncRequest(replacementToken))).status, 401);
 });
 
 test('snapshot upload rejects an oversized body before JSON parsing', async () => {

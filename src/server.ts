@@ -2,7 +2,7 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { ForbiddenError, hasHarnessRole, verifyHarnessAccess, type AuthIdentity, type AuthVerifier } from './auth.js';
 import {
   getData, refreshData, filterSessions, getSessionById,
@@ -73,7 +73,7 @@ export function createApp(options: {
   app.use('/api/*', cors({
     origin: origin => allowedOrigins.has(origin) ? origin : '',
     allowHeaders: ['Authorization', 'Content-Type'],
-    allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'],
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     maxAge: 600,
   }));
 
@@ -85,6 +85,18 @@ export function createApp(options: {
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/status' || c.req.path.startsWith('/api/public/')) return next();
     const authorization = c.req.header('Authorization') || '';
+    if (authorization.startsWith('Sync ')) {
+      const syncAllowed = (c.req.path === '/api/me/sharing' && c.req.method === 'GET') ||
+        (c.req.path === '/api/me/public-snapshot' && c.req.method === 'PUT');
+      if (!syncAllowed) return c.json({ error: 'Forbidden' }, 403);
+      if (!await profileStoreReady) return c.json({ error: 'Profile storage unavailable' }, 503);
+      const token = authorization.slice('Sync '.length).trim();
+      if (!/^ha_sync_[A-Za-z0-9_-]{40,}$/.test(token)) return c.json({ error: 'Invalid sync token' }, 401);
+      const subject = await profileStore.getSubjectForSyncTokenHash(createHash('sha256').update(token).digest('hex'));
+      if (!subject) return c.json({ error: 'Invalid sync token' }, 401);
+      c.set('identity', { subject, services: { 'harness-analyzer': 'user' } });
+      return next();
+    }
     if (!authorization.startsWith('Bearer ')) {
       return c.json({ error: 'Authentication required' }, 401);
     }
@@ -186,6 +198,21 @@ export function createApp(options: {
     c.header('Cache-Control', 'no-store');
     if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
     return c.json(sharingResponse(await ensureSharing(c.get('identity'))));
+  });
+
+  app.post('/api/me/sync-token', async (c) => {
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const identity = c.get('identity');
+    await ensureSharing(identity);
+    const token = `ha_sync_${randomBytes(32).toString('base64url')}`;
+    await profileStore.setSyncTokenHash(identity.subject, createHash('sha256').update(token).digest('hex'));
+    return c.json({ token });
+  });
+
+  app.delete('/api/me/sync-token', async (c) => {
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    await profileStore.revokeSyncToken(c.get('identity').subject);
+    return c.json({ ok: true });
   });
 
   app.put('/api/me/sharing', async (c) => {

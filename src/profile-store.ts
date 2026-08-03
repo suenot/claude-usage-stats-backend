@@ -42,6 +42,9 @@ export interface ProfileStore {
   saveSnapshot(subject: string, snapshot: PublicSnapshotV1): Promise<void>;
   getPublicProfile(handle: string): Promise<PublicProfile | null>;
   getLeaderboard(metric: LeaderboardMetric, limit: number): Promise<LeaderboardUser[]>;
+  getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null>;
+  setSyncTokenHash(subject: string, tokenHash: string): Promise<void>;
+  revokeSyncToken(subject: string): Promise<void>;
 }
 
 export class HandleConflictError extends Error {
@@ -95,6 +98,8 @@ interface MemoryRecord {
 export class MemoryProfileStore implements ProfileStore {
   private readonly records = new Map<string, MemoryRecord>();
   private readonly subjectsByHandle = new Map<string, string>();
+  private readonly subjectsBySyncTokenHash = new Map<string, string>();
+  private readonly syncTokenHashesBySubject = new Map<string, string>();
 
   async init(): Promise<void> {}
 
@@ -166,6 +171,24 @@ export class MemoryProfileStore implements ProfileStore {
       .slice(0, limit)
       .map(clone);
   }
+
+  async getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null> {
+    return this.subjectsBySyncTokenHash.get(tokenHash) || null;
+  }
+
+  async setSyncTokenHash(subject: string, tokenHash: string): Promise<void> {
+    if (!this.records.has(subject)) throw new Error('Sharing profile does not exist');
+    const previous = this.syncTokenHashesBySubject.get(subject);
+    if (previous) this.subjectsBySyncTokenHash.delete(previous);
+    this.syncTokenHashesBySubject.set(subject, tokenHash);
+    this.subjectsBySyncTokenHash.set(tokenHash, subject);
+  }
+
+  async revokeSyncToken(subject: string): Promise<void> {
+    const previous = this.syncTokenHashesBySubject.get(subject);
+    if (previous) this.subjectsBySyncTokenHash.delete(previous);
+    this.syncTokenHashesBySubject.delete(subject);
+  }
 }
 
 export class PostgresProfileStore implements ProfileStore {
@@ -201,6 +224,12 @@ export class PostgresProfileStore implements ProfileStore {
       CREATE INDEX IF NOT EXISTS public_snapshots_cost_idx ON public_snapshots (total_cost DESC);
       CREATE INDEX IF NOT EXISTS public_snapshots_tokens_idx ON public_snapshots (total_tokens DESC);
       CREATE INDEX IF NOT EXISTS public_snapshots_sessions_idx ON public_snapshots (total_sessions DESC);
+      CREATE TABLE IF NOT EXISTS sync_tokens (
+        subject TEXT PRIMARY KEY REFERENCES share_profiles(subject) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_used_at TIMESTAMPTZ
+      );
     `);
   }
 
@@ -296,6 +325,26 @@ export class PostgresProfileStore implements ProfileStore {
       value: row.value,
       generated_at: new Date(row.generated_at).toISOString(),
     }));
+  }
+
+  async getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null> {
+    const result = await this.pool.query(
+      `UPDATE sync_tokens SET last_used_at = NOW() WHERE token_hash = $1 RETURNING subject`,
+      [tokenHash],
+    );
+    return result.rows[0] ? String(result.rows[0].subject) : null;
+  }
+
+  async setSyncTokenHash(subject: string, tokenHash: string): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO sync_tokens (subject, token_hash) VALUES ($1, $2)
+       ON CONFLICT (subject) DO UPDATE SET token_hash = EXCLUDED.token_hash, created_at = NOW(), last_used_at = NULL`,
+      [subject, tokenHash],
+    );
+  }
+
+  async revokeSyncToken(subject: string): Promise<void> {
+    await this.pool.query(`DELETE FROM sync_tokens WHERE subject = $1`, [subject]);
   }
 }
 
