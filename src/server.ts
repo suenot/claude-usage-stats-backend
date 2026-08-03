@@ -22,6 +22,7 @@ import {
   type ShareVisibility,
 } from './profile-store.js';
 import { buildPublicSnapshot, InvalidSnapshotError, validatePublicSnapshot } from './public-snapshot.js';
+import { buildSummary, getProjectStats as getPrivateProjectStats, InvalidPrivateSnapshotError, validatePrivateAnalyticsSnapshot } from '@claude-stats/core';
 
 type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
 
@@ -81,13 +82,18 @@ export function createApp(options: {
     maxSize: 1_000_000,
     onError: c => c.json({ error: 'Snapshot is too large' }, 413),
   }));
+  app.use('/api/me/analytics', bodyLimit({
+    maxSize: 50 * 1024 * 1024,
+    onError: c => c.json({ error: 'Analytics upload is too large' }, 413),
+  }));
 
   app.use('/api/*', async (c, next) => {
     if (c.req.path === '/api/status' || c.req.path.startsWith('/api/public/')) return next();
     const authorization = c.req.header('Authorization') || '';
     if (authorization.startsWith('Sync ')) {
       const syncAllowed = (c.req.path === '/api/me/sharing' && c.req.method === 'GET') ||
-        (c.req.path === '/api/me/public-snapshot' && c.req.method === 'PUT');
+        (c.req.path === '/api/me/public-snapshot' && c.req.method === 'PUT') ||
+        (c.req.path === '/api/me/analytics' && c.req.method === 'PUT');
       if (!syncAllowed) return c.json({ error: 'Forbidden' }, 403);
       if (!await profileStoreReady) return c.json({ error: 'Profile storage unavailable' }, 503);
       const token = authorization.slice('Sync '.length).trim();
@@ -118,7 +124,7 @@ export function createApp(options: {
   app.use('/api/*', async (c, next) => {
     const independent = c.req.path === '/api/status' || c.req.path.startsWith('/api/public/') ||
       c.req.path === '/api/models/pricing' || c.req.path === '/api/me/sharing' ||
-      c.req.path === '/api/me/public-snapshot';
+      c.req.path === '/api/me/public-snapshot' || c.req.path.startsWith('/api/me/analytics');
     if (!ready() && !independent) {
       return c.json({ loading: true, message: 'Collecting data, please wait...' }, 503);
     }
@@ -269,6 +275,79 @@ export function createApp(options: {
       throw error;
     }
   });
+
+  const privateSessions = async (identity: AuthIdentity) => {
+    const snapshot = await profileStore.getPrivateAnalytics(identity.subject);
+    return snapshot?.sessions || null;
+  };
+
+  app.put('/api/me/analytics', async (c) => {
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const identity = c.get('identity');
+    await ensureSharing(identity);
+    try {
+      const snapshot = validatePrivateAnalyticsSnapshot(await c.req.json());
+      await profileStore.savePrivateAnalytics(identity.subject, snapshot);
+      // Public data is derived server-side from the same source of truth; raw session data never reaches public routes.
+      await profileStore.saveSnapshot(identity.subject, buildPublicSnapshot(snapshot.sessions, 'details'));
+      return c.json({ ok: true, generated_at: snapshot.generated_at, sessions: snapshot.sessions.length, history_included: snapshot.history_included });
+    } catch (error) {
+      if (error instanceof InvalidPrivateSnapshotError) return c.json({ error: error.message }, 400);
+      if (error instanceof StaleSnapshotError) return c.json({ error: error.message }, 409);
+      if (error instanceof SyntaxError) return c.json({ error: 'Invalid body' }, 400);
+      throw error;
+    }
+  });
+
+  app.get('/api/me/analytics/summary', async (c) => {
+    const sessions = await privateSessions(c.get('identity'));
+    if (!sessions) return c.json({ error: 'No synchronized analytics. Run harness-analyzer sync on your computer.' }, 404);
+    return c.json(buildSummary(sessions));
+  });
+  app.get('/api/me/analytics/sessions', async (c) => {
+    const sessions = await privateSessions(c.get('identity'));
+    if (!sessions) return c.json({ error: 'No synchronized analytics. Run harness-analyzer sync on your computer.' }, 404);
+    const filtered = filterSessions(sessions, {
+      source: c.req.query('source'), model: c.req.query('model'), from: c.req.query('from'), to: c.req.query('to'),
+      minCost: c.req.query('minCost') ? parseFloat(c.req.query('minCost')!) : undefined,
+    });
+    const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '100', 10) || 100, 1), 500);
+    const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
+    const sorted = filtered.sort((a, b) => b.date.localeCompare(a.date) || b.time.localeCompare(a.time));
+    return c.json({ total: filtered.length, sessions: sorted.slice(offset, offset + limit) });
+  });
+  app.get('/api/me/analytics/sessions/:id', async (c) => {
+    const sessions = await privateSessions(c.get('identity'));
+    if (!sessions) return c.json({ error: 'No synchronized analytics. Run harness-analyzer sync on your computer.' }, 404);
+    const session = getSessionById(sessions, c.req.param('id'));
+    return session ? c.json(session) : c.json({ error: 'Not found' }, 404);
+  });
+  app.get('/api/me/analytics/projects', async (c) => {
+    const sessions = await privateSessions(c.get('identity'));
+    if (!sessions) return c.json({ error: 'No synchronized analytics. Run harness-analyzer sync on your computer.' }, 404);
+    return c.json(getPrivateProjectStats(sessions));
+  });
+  app.get('/api/me/analytics/charts/daily', async (c) => {
+    const sessions = await privateSessions(c.get('identity')); if (!sessions) return c.json({ error: 'No synchronized analytics.' }, 404);
+    return c.json(getDailyChart(sessions, parseInt(c.req.query('days') || '30', 10) || 30));
+  });
+  app.get('/api/me/analytics/charts/daily-models', async (c) => {
+    const sessions = await privateSessions(c.get('identity')); if (!sessions) return c.json({ error: 'No synchronized analytics.' }, 404);
+    return c.json(getDailyModelChart(sessions, parseInt(c.req.query('days') || '30', 10) || 30));
+  });
+  app.get('/api/me/analytics/charts/history', async (c) => {
+    const sessions = await privateSessions(c.get('identity')); if (!sessions) return c.json({ error: 'No synchronized analytics.' }, 404);
+    const rawDays = parseInt(c.req.query('days') || '30', 10);
+    return c.json(getHistoryChart(sessions, { timeframe: c.req.query('timeframe') === '1h' ? '1h' : '1d', groupBy: c.req.query('groupBy') === 'model' ? 'model' : 'harness', days: Number.isNaN(rawDays) ? 30 : Math.max(0, rawDays) }));
+  });
+  app.get('/api/me/analytics/charts/heatmap', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getHeatmapData(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/sources', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getSourceStats(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/source-usage', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getSourceUsage(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/models', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getModelStats(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/model-usage', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getModelUsage(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/hourly', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getHourlyStats(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/cache', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getCacheStats(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/cache-expiry', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getCacheExpiryStats(sessions, { from: c.req.query('from'), to: c.req.query('to') })) : c.json({ error: 'No synchronized analytics.' }, 404); });
 
   app.get('/api/me/public-snapshot-source', (c) => {
     const identity = c.get('identity');

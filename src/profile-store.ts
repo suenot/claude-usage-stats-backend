@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 import type { PublicSnapshotV1 } from './public-snapshot.js';
+import type { PrivateAnalyticsSnapshotV1 } from '@claude-stats/core';
 
 export type ShareVisibility = 'private' | 'totals' | 'details';
 export type LeaderboardMetric = 'tokens' | 'cost' | 'sessions';
@@ -40,6 +41,8 @@ export interface ProfileStore {
   getSharing(subject: string): Promise<SharingProfile | null>;
   upsertSharing(subject: string, update: SharingUpdate & { handle: string }): Promise<SharingProfile>;
   saveSnapshot(subject: string, snapshot: PublicSnapshotV1): Promise<void>;
+  savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void>;
+  getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null>;
   getPublicProfile(handle: string): Promise<PublicProfile | null>;
   getLeaderboard(metric: LeaderboardMetric, limit: number): Promise<LeaderboardUser[]>;
   getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null>;
@@ -93,6 +96,7 @@ function clone<T>(value: T): T {
 interface MemoryRecord {
   profile: SharingProfile;
   snapshot: PublicSnapshotV1 | null;
+  privateAnalytics: PrivateAnalyticsSnapshotV1 | null;
 }
 
 export class MemoryProfileStore implements ProfileStore {
@@ -122,7 +126,7 @@ export class MemoryProfileStore implements ProfileStore {
       leaderboard_opt_in: update.leaderboard_opt_in ?? existing?.profile.leaderboard_opt_in ?? false,
       snapshot_generated_at: existing?.snapshot?.generated_at || null,
     };
-    this.records.set(subject, { profile, snapshot: existing?.snapshot || null });
+    this.records.set(subject, { profile, snapshot: existing?.snapshot || null, privateAnalytics: existing?.privateAnalytics || null });
     this.subjectsByHandle.set(handle, subject);
     return clone(profile);
   }
@@ -135,6 +139,17 @@ export class MemoryProfileStore implements ProfileStore {
     }
     record.snapshot = clone(snapshot);
     record.profile.snapshot_generated_at = snapshot.generated_at;
+  }
+
+  async savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void> {
+    const record = this.records.get(subject);
+    if (!record) throw new Error('Sharing profile does not exist');
+    if (record.privateAnalytics && Date.parse(snapshot.generated_at) < Date.parse(record.privateAnalytics.generated_at)) throw new StaleSnapshotError();
+    record.privateAnalytics = clone(snapshot);
+  }
+
+  async getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null> {
+    return this.records.get(subject)?.privateAnalytics ? clone(this.records.get(subject)!.privateAnalytics!) : null;
   }
 
   async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
@@ -230,6 +245,14 @@ export class PostgresProfileStore implements ProfileStore {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         last_used_at TIMESTAMPTZ
       );
+      CREATE TABLE IF NOT EXISTS private_analytics_snapshots (
+        subject TEXT PRIMARY KEY REFERENCES share_profiles(subject) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL,
+        generated_at TIMESTAMPTZ NOT NULL,
+        uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        snapshot JSONB NOT NULL,
+        snapshot_hash TEXT NOT NULL
+      );
     `);
   }
 
@@ -284,6 +307,25 @@ export class PostgresProfileStore implements ProfileStore {
         snapshot.totals.total_tokens, snapshot.totals.total_sessions, snapshotHash(snapshot)],
     );
     if (result.rowCount === 0) throw new StaleSnapshotError();
+  }
+
+  async savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void> {
+    const result = await this.pool.query(
+      `INSERT INTO private_analytics_snapshots (subject, schema_version, generated_at, snapshot, snapshot_hash)
+       VALUES ($1, $2, $3, $4::jsonb, $5)
+       ON CONFLICT (subject) DO UPDATE SET schema_version = EXCLUDED.schema_version,
+         generated_at = EXCLUDED.generated_at, uploaded_at = NOW(), snapshot = EXCLUDED.snapshot, snapshot_hash = EXCLUDED.snapshot_hash
+       WHERE private_analytics_snapshots.generated_at <= EXCLUDED.generated_at`,
+      [subject, snapshot.schema_version, snapshot.generated_at, JSON.stringify(snapshot), snapshotHash(snapshot as unknown as PublicSnapshotV1)],
+    );
+    if (result.rowCount === 0) throw new StaleSnapshotError();
+  }
+
+  async getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null> {
+    const result = await this.pool.query(
+      `SELECT snapshot FROM private_analytics_snapshots WHERE subject = $1`, [subject],
+    );
+    return result.rows[0] ? result.rows[0].snapshot as PrivateAnalyticsSnapshotV1 : null;
   }
 
   async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {

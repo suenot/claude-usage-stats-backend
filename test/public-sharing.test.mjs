@@ -13,6 +13,7 @@ import {
   buildPublicSnapshot,
   validatePublicSnapshot,
 } from '../dist/public-snapshot.js';
+import { buildPrivateAnalyticsSnapshot } from '@claude-stats/core';
 
 process.env.NODE_ENV = 'test';
 const { createApp } = await import('../dist/server.js');
@@ -279,6 +280,25 @@ test('snapshot upload rejects an oversized body before JSON parsing', async () =
     body,
   }));
   assert.equal(response.status, 413);
+});
+
+test('private analytics are writable by a sync token and readable only by their owner', async () => {
+  const app = appFor(new MemoryProfileStore());
+  const tokenResponse = await app.request('/api/me/sync-token', request('alice', { method: 'POST' }));
+  const syncToken = (await tokenResponse.json()).token;
+  const privateSnapshot = buildPrivateAnalyticsSnapshot(sessions);
+  const upload = await app.request('/api/me/analytics', syncRequest(syncToken, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(privateSnapshot),
+  }));
+  assert.equal(upload.status, 200);
+  const ownerSessions = await app.request('/api/me/analytics/sessions', request('alice'));
+  assert.equal(ownerSessions.status, 200);
+  const stored = await ownerSessions.json();
+  assert.equal(stored.total, 1);
+  assert.equal(stored.sessions[0].file, 'remote');
+  assert.equal(JSON.stringify(stored).includes('secret prompt'), false);
+  assert.equal((await app.request('/api/me/analytics/sessions', request('bob'))).status, 404);
+  assert.equal((await app.request('/api/me/analytics/sessions', syncRequest(syncToken))).status, 403);
 });
 
 test('snapshot source supports development default, explicit disable, and strict owner exception', async () => {
